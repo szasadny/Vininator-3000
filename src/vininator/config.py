@@ -45,13 +45,9 @@ XWINES_RATINGS_PARQUET = "xwines_ratings.parquet"
 # slow response cleanly exhausts the RateLimiter's retries instead of failing
 # the whole row.
 #
-# The contact string is supplied via env (`VININATOR_NOMINATIM_CONTACT`) — never
-# hardcoded here, because this file is committed and a personal email leaking
-# into git history is a one-way mistake. The default is the project repo URL,
-# which satisfies Nominatim's "contactable operator" requirement without
-# exposing any individual.
+# The contact string is supplied via env (`VININATOR_NOMINATIM_CONTACT`) and
+# has no in-source default.
 NOMINATIM_USER_AGENT_TEMPLATE = "vininator-3000/0.1 ({contact})"
-NOMINATIM_DEFAULT_CONTACT = "+https://github.com/vininator-3000/vininator-3000"
 NOMINATIM_RATE_LIMIT_SEC = 1.0
 NOMINATIM_TIMEOUT_SEC = 10.0
 
@@ -85,7 +81,7 @@ GEOCODE_BAD_RESULT_TYPES: frozenset[str] = frozenset({
 })
 
 # ---------------------------------------------------------------------------
-# Soil + DEM (PR2)
+# Soil + DEM
 # ---------------------------------------------------------------------------
 #
 # SoilGrids v2 (ISRIC) is free, no auth, but the public endpoint is flaky on
@@ -114,7 +110,7 @@ SOILGRIDS_BUFFER_DEG = 0.005
 SOILGRIDS_RETRIES = 3
 SOILGRIDS_BACKOFF_SEC: tuple[float, ...] = (1.0, 4.0, 16.0)
 SOILGRIDS_TIMEOUT_SEC = 30.0
-SOILGRIDS_RATE_LIMIT_SEC = 1.0  # be polite to ISRIC
+SOILGRIDS_RATE_LIMIT_SEC = 1.0
 
 # SoilGrids v2 returns d-factored integers — `unit_measure.d_factor` in the
 # response. Divide the raw `mean` by this number to land directly in the layer's
@@ -157,6 +153,98 @@ SOIL_RAW_DIRNAME = "soil_raw"
 DEM_RAW_DIRNAME = "dem"
 SOIL_PARQUET = "soil.parquet"
 
+# ---------------------------------------------------------------------------
+# Climate (Open-Meteo Historical Weather API)
+# ---------------------------------------------------------------------------
+#
+# Open-Meteo wraps the same ERA5-Land reanalysis (0.1° / ~11 km) we'd otherwise
+# pull from Copernicus CDS, but behind a clean JSON REST endpoint with no
+# account, no licence acceptance, and a single request per region for all 31
+# years. One JSON cache file per region under `data/raw/open_meteo/{slug}.json`
+# *is* the resume state — restart picks up wherever the disk says it left off.
+#
+# Free-tier ToS is non-commercial; Vininator is a personal/learning project so
+# this is fine. If commercial use ever lands on the table, the same code points
+# at the paid endpoint by changing the base URL and adding an API key.
+
+OPEN_METEO_BASE_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+# The five daily variables we need. The names map cleanly to our feature math:
+#   temperature_2m_min   → tmin_c (spring-frost detection)
+#   temperature_2m_mean  → tmean_c (GDD, climatology baseline)
+#   temperature_2m_max   → tmax_c (heat-spike days, diurnal range)
+#   precipitation_sum    → precip_mm (growing-season + harvest precip)
+#   shortwave_radiation_sum → ssrd_mj (sunshine / cloud-cover proxy)
+# Open-Meteo returns these in °C, mm, MJ/m² by default — no unit conversions
+# needed downstream.
+OPEN_METEO_DAILY_VARS: tuple[str, ...] = (
+    "temperature_2m_min",
+    "temperature_2m_mean",
+    "temperature_2m_max",
+    "precipitation_sum",
+    "shortwave_radiation_sum",
+)
+
+OPEN_METEO_TIMEOUT_SEC = 1800.0
+# 10 s between requests = ~6 req/min. At this rate the full 1,377-region pull 
+# takes ~4 hours sequentially. Empirically, 429s on ~40% of cold-cache regions.
+OPEN_METEO_RATE_LIMIT_SEC = 10.0
+# Backoff for transient errors (5xx, network blips). 429s prefer the server's
+# `Retry-After` header when present (see `_parse_retry_after`); these values
+# are the fallback when the header is missing.
+OPEN_METEO_BACKOFF_SEC: tuple[float, ...] = (30.0, 60.0, 120.0, 180.0, 240.0, 300.0, 900.0, 1800.0)
+
+# Attribution baked into the parquet metadata. Open-Meteo data is CC BY 4.0 and
+# requires attribution to both Open-Meteo and the upstream ERA5-Land source.
+OPEN_METEO_ATTRIBUTION = (
+    "Weather data by Open-Meteo.com (https://open-meteo.com), CC BY 4.0, "
+    "derived from ERA5-Land reanalysis by ECMWF / Copernicus Climate Change "
+    "Service. Generated using Copernicus Climate Change Service information."
+)
+
+OPEN_METEO_RAW_DIRNAME = "open_meteo"
+CLIMATE_PARQUET = "climate.parquet"
+CLIMATOLOGY_PARQUET = "climatology.parquet"
+
+# 1991 is the start of the modern ERA5-Land record we care about; 2021 is the
+# X-Wines Date cutoff. Anything outside this window is out of scope.
+CLIMATE_YEAR_RANGE: tuple[int, int] = (1991, 2021)
+
+# Climatology baseline ends at the training cutoff (2018) so the anomaly column
+# carries zero information leakage into the 2019–2021 future-vintage holdout.
+# This deviates from the WMO standard (1991–2020); the leakage cost outweighs
+# the textbook convention.
+CLIMATOLOGY_WINDOW: tuple[int, int] = (1991, 2018)
+CLIMATOLOGY_MIN_YEARS = 20
+
+# Growing-season month windows: month numbers (inclusive).
+# NH: April–October of vintage_year.
+# SH: October–December of (vintage_year − 1) plus January–April of vintage_year.
+# Vintage year = harvest year for both hemispheres (X-Wines convention).
+GROWING_SEASON_NH: tuple[int, int] = (4, 10)
+GROWING_SEASON_SH_PREV_YEAR: tuple[int, int] = (10, 12)
+GROWING_SEASON_SH_VINTAGE: tuple[int, int] = (1, 4)
+
+# Spring frost window: the last two months before bud break in each hemisphere.
+SPRING_FROST_MONTHS_NH: tuple[int, int] = (4, 5)
+SPRING_FROST_MONTHS_SH: tuple[int, int] = (10, 11)
+
+GDD_BASE_TEMP_C = 10.0
+HEAT_SPIKE_TMAX_C = 35.0
+FROST_TMIN_C = 0.0
+HARVEST_WINDOW_DAYS = 30
+
+# Absolute climate features. Anomaly columns are `<name>_anom`.
+CLIMATE_ABSOLUTE_FEATURES: tuple[str, ...] = (
+    "gdd_10c",
+    "precip_total_mm",
+    "precip_harvest_mm",
+    "heat_spike_days",
+    "frost_days_spring",
+    "diurnal_range_mean",
+    "solar_total_mj",
+)
+
 
 def _project_root() -> Path:
     """Walk up from this file until we find the repo's `pyproject.toml`.
@@ -183,7 +271,7 @@ class Settings(BaseSettings):
 
     data_dir: Path = Field(default=Path("data"))
     xwines_variant: Literal["test", "slim", "full"] = Field(default="test")
-    nominatim_contact: str = Field(default=NOMINATIM_DEFAULT_CONTACT)
+    nominatim_contact: str = Field(default="")
 
     @field_validator("data_dir", mode="after")
     @classmethod
@@ -239,6 +327,13 @@ class Settings(BaseSettings):
     @property
     def nominatim_user_agent(self) -> str:
         """User agent sent to Nominatim, built from the env-driven contact."""
+        if not self.nominatim_contact:
+            raise RuntimeError(
+                "VININATOR_NOMINATIM_CONTACT is unset. Nominatim's TOS requires a "
+                "contactable operator string (e.g. '+https://github.com/<you>/<fork>' "
+                "or 'mailto:you@example.com'). Set it in your local .env before "
+                "running geocoding."
+            )
         return NOMINATIM_USER_AGENT_TEMPLATE.format(contact=self.nominatim_contact)
 
     @computed_field  # type: ignore[prop-decorator]
@@ -259,6 +354,24 @@ class Settings(BaseSettings):
         """Aggregated per-region soil + terrain features."""
         return self.interim_dir / SOIL_PARQUET
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def open_meteo_raw_dir(self) -> Path:
+        """One JSON per region: the raw Open-Meteo Historical Weather response."""
+        return self.raw_dir / OPEN_METEO_RAW_DIRNAME
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def climate_parquet(self) -> Path:
+        """Per (region, vintage_year) climate features + anomalies."""
+        return self.interim_dir / CLIMATE_PARQUET
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def climatology_parquet(self) -> Path:
+        """Per-region long-form climatology means over CLIMATOLOGY_WINDOW."""
+        return self.interim_dir / CLIMATOLOGY_PARQUET
+
     def ensure_dirs(self) -> None:
         """Create the data layout if missing. Idempotent."""
         for d in (
@@ -267,6 +380,7 @@ class Settings(BaseSettings):
             self.processed_dir,
             self.soil_raw_dir,
             self.dem_raw_dir,
+            self.open_meteo_raw_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
 

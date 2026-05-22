@@ -19,6 +19,7 @@ from vininator.data.geocode import (
     scan_geocode,
 )
 from vininator.data.load import download_xwines, xwines_info
+from vininator.features.climate import build_climate_table
 from vininator.features.soil import build_soil_table
 
 app = typer.Typer(
@@ -139,6 +140,34 @@ def features_soil(
         force=force, limit=limit, progress_fn=progress, notify_fn=typer.echo
     )
     typer.echo(f"Soil table: {path}")
+
+
+@features_app.command("climate")
+def features_climate(
+    force: bool = typer.Option(
+        False, "--force", help="Re-fetch every JSON and rebuild every row."
+    ),
+    limit: int | None = typer.Option(
+        None, "--limit", help="Process at most N regions this run (resumable)."
+    ),
+) -> None:
+    """Pull Open-Meteo Historical Weather per region and derive climate features.
+
+    Reads `data/interim/geocode.parquet` (status='ok' rows surviving the
+    `filter_to_usable` blacklist). One HTTP request per region covers all years
+    1991–2021 across the five daily variables; the JSON cache is the resume
+    state. Smoke test: `vininator features climate --limit 5` — expect
+    seconds to a minute total on a cold cache.
+    """
+
+    def progress(done: int, total: int) -> None:
+        pct = 100.0 * done / total if total else 100.0
+        typer.echo(f"... climate {done}/{total} ({pct:.1f}%)")
+
+    path = build_climate_table(
+        force=force, limit=limit, progress_fn=progress, notify_fn=typer.echo
+    )
+    typer.echo(f"Climate table: {path}")
 
 
 if __name__ == "__main__":

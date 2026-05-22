@@ -1,6 +1,6 @@
 # Vininator 3000 — Project Plan
 
-A wine rating + tasting-note predictor trained on the X-Wines dataset, with a terroir feature pipeline combining ERA5 climate reanalysis with SoilGrids soil and terrain properties.
+A wine rating + tasting-note predictor trained on the X-Wines dataset, with a terroir feature pipeline combining ERA5-Land climate reanalysis (via Open-Meteo) with SoilGrids soil and terrain properties.
 
 ---
 
@@ -12,7 +12,7 @@ Three prediction targets, in increasing order of difficulty:
 2. **Structured profile** — body, acidity (X-Wines ships these as labels) + alcohol % (`ABV`)
 3. **Tasting notes** — retrieve the most similar real-review text and a multi-label set of flavor descriptors (X-Wines ships food pairings as the `Harmonize` column)
 
-**Inputs:** grape variety/blend, region (hierarchical), per-rating vintage year, producer (`WineryID`), `age_at_review`, plus a derived **terroir feature block** that combines `region × vintage` weather from ERA5 with `region`-level soil and terrain properties from SoilGrids.
+**Inputs:** grape variety/blend, region (hierarchical), per-rating vintage year, producer (`WineryID`), `age_at_review`, plus a derived **terroir feature block** that combines `region × vintage` weather from ERA5-Land (via Open-Meteo) with `region`-level soil and terrain properties from SoilGrids.
 
 **Core objective:** build a predictive model that estimates a wine's sensory profile — including rating, structure, and tasting characteristics — from structured wine metadata, the bottle age at the moment of rating, and vintage-specific terroir conditions.
 
@@ -42,7 +42,7 @@ X-Wines CSVs (test | slim | full)
   data/raw/xwines_wines.parquet
   data/raw/xwines_ratings.parquet   (with derived `age_at_review`)
         │
-        ├─► geocoded regions ──┬─► ERA5 weather pull ──► climate.parquet
+        ├─► geocoded regions ──┬─► Open-Meteo weather pull ──► climate.parquet
         │                       │                                │
         │                       └─► SoilGrids pull   ──► soil.parquet
         │                                                        │
@@ -61,7 +61,7 @@ X-Wines CSVs (test | slim | full)
         ▼
   FastAPI backend ──► React + Vite frontend (web UI)
                          │
-                         └─► TerroirProvider (cache-first ERA5 + SoilGrids
+                         └─► TerroirProvider (cache-first Open-Meteo + SoilGrids
                                               for vintages newer than training)
 ```
 
@@ -88,26 +88,28 @@ The ML side is the primary deliverable. The web UI is a thin wrapper around the 
 - The same `(lat, lon)` feeds both the climate and the soil pipeline below.
 - **Audit `result_type` before downstream use.** Nominatim returns the OSM entity type ("administrative", "region", "city", "village", "house", "monument", …). Some X-Wines region strings resolve to the *wrong* entity — e.g. "Buenos Aires, Argentina" → city centre, "Scanderbeg, Albania" → a public square named after the historical figure. These rows pass `status='ok'` but their coordinates don't land in vineyard country, so SoilGrids returns null and the terroir signal is junk. Before any model trains on these features, filter the geocode parquet to keep only `result_type ∈ {administrative, region, county, state, locality, suburb, isolated_dwelling, hamlet, village}` (or a similar whitelist refined against the actual distribution). The soil pull is unaffected — CatBoost handles the nulls — but the filter must happen before training so the bad rows don't enter the training set.
 
-**Weather (ERA5 reanalysis via Copernicus CDS)**
+**Weather (ERA5-Land via Open-Meteo Historical Weather API)**
 
-**Strategy: per-region multi-year daily pull.** One CDS request per region covering all vintages (1950–2021) × growing season × daily resolution. **2,160 requests total** (one per unique `RegionName`), one-time, cached to disk. Working set after the eligible-cell filter (`>= 5 wines per (region, vintage)`) is 18,478 cells — same data, just sliced differently downstream.
+**Strategy: one HTTP request per region.** Open-Meteo wraps the same ERA5-Land reanalysis (0.1° / ~11 km, 1950-present) that Copernicus CDS publishes, behind a clean JSON REST endpoint. A single request fetches all of `CLIMATE_YEAR_RANGE` × all five daily variables for one (lat, lon). After the PR2.5 geocode blacklist there are **~1,377 requests total**, cached as one JSON per region under `data/raw/open_meteo/{slug}.json`. No account, no licence acceptance, no NetCDF parsing.
 
-**Variables pulled per region:**
+**Why Open-Meteo over CDS directly?** Same underlying data, but 1,377 small HTTP calls instead of 8.3k–128k chunked CDS calls; the CDS per-request cost limit forces year-and-statistic chunking that Open-Meteo handles server-side. CDS would still be a fallback if Open-Meteo ToS becomes a blocker (see below).
 
-| CDS variable | Used for |
-| --- | --- |
-| `2m_temperature` (daily mean) | GDD, anomalies |
-| `2m_temperature` (daily max) | Heat-spike days, diurnal range |
-| `2m_temperature` (daily min) | Spring frost days, diurnal range |
-| `total_precipitation` (daily sum, mm) | Growing-season + harvest-month precip |
-| `surface_solar_radiation_downwards` (daily sum, J/m²) | Sunshine / cloud-cover proxy |
+**Variables pulled per region** (Open-Meteo daily-API names → our feature math):
 
-Use the derived dataset `reanalysis-era5-single-levels-daily-statistics` (it ships daily min/max/mean directly — no client-side hourly→daily aggregation). Fall back to `reanalysis-era5-land` for high-altitude or coastal regions if the parent grid is too coarse.
+| Open-Meteo variable | Units | Used for |
+| --- | --- | --- |
+| `temperature_2m_min` | °C | Spring frost days, diurnal range |
+| `temperature_2m_mean` | °C | GDD, climatology baseline, anomalies |
+| `temperature_2m_max` | °C | Heat-spike days, diurnal range |
+| `precipitation_sum` | mm | Growing-season + harvest-month precip |
+| `shortwave_radiation_sum` | MJ/m² | Sunshine / cloud-cover proxy |
 
-**Growing season mask** (applied after pulling the full year so we can recompute thresholds later without re-fetching):
+Units land in exactly the form `compute_climate_features` expects — no unit conversion in the loader.
 
-- Northern hemisphere (Country in Europe/USA/Canada/Asia): **April–October**.
-- Southern hemisphere (Country in Argentina/Chile/Australia/New Zealand/South Africa/Brazil): **October (prev. year) – April**.
+**Growing season mask** (applied at feature time, not at fetch time, so we can recompute thresholds without re-fetching):
+
+- Northern hemisphere (lat ≥ 0): **April–October** of vintage_year.
+- Southern hemisphere (lat < 0): **October of (vintage_year − 1) – April** of vintage_year.
 
 **Features computed per `(region, vintage)`:**
 
@@ -117,23 +119,21 @@ Use the derived dataset `reanalysis-era5-single-levels-daily-statistics` (it shi
 - **Heat spike days** — count of days `Tmax > 35°C`.
 - **Spring frost days** — count of April–May (or Oct–Nov SH) days `Tmin < 0°C`.
 - **Mean diurnal temperature range** — average of `(Tmax − Tmin)` across the season.
-- **Mean daily solar radiation** — season-average J/m².
-- **Anomaly vs. 30-year regional climatology** for each of the above. The 30-year baseline per region is computed once from the same per-region pull (no extra CDS calls). A hot year in Bordeaux means something different from a hot year in Mendoza, so the anomaly often predicts better than the absolute value.
+- **Total growing-season solar radiation** (MJ/m²).
+- **Anomaly vs. 1991–2018 regional climatology** for each of the above. The baseline window deliberately ends at the training cutoff (2018) rather than the WMO-standard 1991–2020, so the anomaly column carries **zero information leakage** into the 2019–2021 future-vintage holdout. If the climatology used 2019–2020 it would peek at the held-out years and overstate the model's out-of-sample skill on vintages we haven't trained on. The climatology is computed once per region from the same per-region pull (no extra HTTP calls). A hot year in Bordeaux means something different from a hot year in Mendoza, so the anomaly often predicts better than the absolute value.
 
-**CDS compliance & politeness (non-negotiable)**
+**Partial-vintage handling.** A growing-season window may extend outside the pulled year range (e.g. a Southern-hemisphere 1991 vintage's October–December 1990 leg falls before 1991) or carry explicit nulls at the trailing edge (Open-Meteo backfills the most recent days over weeks). The batch path computes features on whatever days are present and sets `is_partial=True` on the row — both for missing dates and for null `tmean` inside the season. Rows are kept; the downstream model can decide whether to use them. The Phase 7 `TerroirProvider` is the only path that *substitutes* climatology for the partial season — batch never does.
 
-- **License acceptance.** The CDS account must accept the ERA5 product licence in the web UI once before the API will serve data — the loader prints the licence URL on first 403 and stops, rather than retrying blindly.
-- **Concurrency cap = 8 in-flight requests.** CDS allows up to ~20 but caps at the operator's discretion; staying at 8 leaves headroom for other users and avoids triggering anti-abuse throttling.
-- **Inter-submission delay = 250 ms.** Don't fire 8 requests in the same millisecond; stagger submissions.
-- **Backoff on 429/5xx.** Exponential backoff (2s, 4s, 8s, …, cap 5 min) with full jitter. **Never retry on 401/403** — those are credential/licence problems, fail loudly.
-- **Resume from disk, not memory.** Each region's raw NetCDF is written atomically to `data/raw/era5/<region_id>.nc` (`tmp` → `rename`). On restart, the loader skips any region whose `.nc` already exists and is non-empty. No central state file — the cache *is* the state.
-- **Single user agent** identifying the project: `vininator-3000/0.1 ({contact})`, where `{contact}` is supplied via the `VININATOR_NOMINATIM_CONTACT` env var (defaults to the project's public GitHub URL). Helps CDS operators contact us before they ban us. **Never hardcode a personal email here** — this file is committed.
-- **Attribution.** Every derived artifact (`climate.parquet`, trained models) gets the Copernicus attribution embedded in its metadata: *"Generated using Copernicus Climate Change Service information [2026]; neither the European Commission nor ECMWF is responsible for any use that may be made of the Copernicus information or data it contains."*
-- **No bulk redistribution.** We ship aggregated features, not the raw NetCDF tiles. (X-Wines is CC0, but ERA5 is CC-BY 4.0 with a redistribution-restricted bulk-data clause — aggregated derivatives are fine, raw tiles are not.)
+**Open-Meteo compliance & politeness**
 
-**Sizing (one-time, end-to-end):** ~2,160 requests × ~5–20 min CDS queue median; at concurrency 8 that's **~3–6 hours wall time** single-machine, resumable. Raw download is ~1 GB NetCDF; aggregated `climate.parquet` lands at ~200 MB full-resolution, ~5 MB after the eligible-cell filter.
+- **Free tier is non-commercial.** Vininator is a personal/learning project so this is fine. If the project ever needs commercial deployment, swap to Open-Meteo's paid endpoint and add the API key to env. No code restructure.
+- **Polite request spacing.** 0.5 s between submissions (~2 req/sec) keeps us comfortably under the 10k/day free-tier cap; 1,377 regions take roughly 12 minutes of wall time even sequentially.
+- **Backoff on transient failures.** Exponential backoff (2s, 4s, 8s, 16s, 32s, 60s) on network blips and 429/5xx. Persistent failure after all retries raises `OpenMeteoError` and stops the run.
+- **Resume from disk, not memory.** Each region's JSON is written atomically (`tmp` → `rename`). On restart, the loader skips any region whose `.json` already exists and is non-empty. No central state file — the cache *is* the state.
+- **User-Agent** identifies the project: `vininator-3000/0.1`. Open-Meteo doesn't demand a contactable operator, but identifying ourselves is good manners.
+- **Attribution.** Every derived artifact (`climate.parquet`, trained models) gets the Open-Meteo + ERA5-Land attribution embedded in its metadata: *"Weather data by Open-Meteo.com, CC BY 4.0, derived from ERA5-Land reanalysis by ECMWF / Copernicus Climate Change Service."*
 
-Credentials live in `~/.cdsapirc` (the `cdsapi` library's default location); the loader also accepts `CDS_API_URL` / `CDS_API_KEY` env vars for ephemeral / CI contexts.
+**Sizing (one-time, end-to-end):** 1,377 HTTP requests, each returning ~3-5 MB JSON. Total raw cache lands at roughly ~5 GB JSON for 1991–2021. Aggregated `climate.parquet` is small (one row per `(region, vintage_year)` × 31 years × ~1.4k regions = ~43k rows).
 
 **Soil & terrain (SoilGrids 250m via ISRIC REST API)**
 
@@ -282,21 +282,21 @@ client → /predict
             │
             ├─ R2 object hit? ───────► return (warm SQLite + LRU)
             │
-            └─ MISS: fetch ERA5 + SoilGrids + DEM
+            └─ MISS: fetch Open-Meteo + SoilGrids + DEM
                        ──► write R2, SQLite, LRU
                        ──► return
 ```
 
 - The same feature code used in Phase 2 is reused — `features/climate.py` and `features/soil.py` expose pure functions over `(lat, lon, year)` that don't care whether they're called from a batch notebook or from a request handler.
-- A request for an unseen `(region, vintage)` pays one slow first call (tens of seconds to a minute for ERA5); every subsequent request for the same key is milliseconds.
+- A request for an unseen `(region, vintage)` pays one Open-Meteo round-trip (sub-second for a single vintage year); every subsequent request for the same key is milliseconds.
 - A background warmer can pre-populate the cache for popular regions × the latest closed vintages on a daily cron — keeps the user-facing miss rate near zero.
 
 **Operational notes**
 
-- ERA5 has a ~5-day publication lag and the latest year's growing season may be incomplete — the provider must detect this and fall back to climatology + partial-season anomalies rather than returning nothing.
+- ERA5-Land (via Open-Meteo) has a ~5-day publication lag and the latest year's growing season may be incomplete — the provider must detect this (null `tmean` inside the season window) and fall back to climatology + partial-season anomalies rather than returning nothing.
 - SoilGrids is essentially time-invariant; one fetch per region is enough forever.
-- Soft TTL: weather entries refresh after 90 days (in case ERA5 backfills), soil entries effectively never expire.
-- API keys (CDS) live in the host's secret store, never in the image.
+- Soft TTL: weather entries refresh after 90 days (in case Open-Meteo backfills ERA5-Land corrections), soil entries effectively never expire.
+- No API keys needed for Open-Meteo's free tier; if we ever move to the commercial tier the key lives in the host's secret store, never in the image.
 
 **Deliverables:** `src/vininator/api/terroir_provider.py`, deployment configs (`fly.toml` or `Dockerfile` + Spaces config), a Cloudflare Pages / Vercel project for the frontend, and a small cron entrypoint for cache warming.
 
@@ -311,7 +311,7 @@ vininator/
 ├── PROJECT.md              # this file
 ├── CLAUDE.md               # operating rules for Claude Code
 ├── data/
-│   ├── raw/                # X-Wines CSVs + parquets, ERA5 daily pulls, SoilGrids responses
+│   ├── raw/                # X-Wines CSVs + parquets, Open-Meteo JSON pulls, SoilGrids responses
 │   ├── interim/            # geocoded regions, climate.parquet, soil.parquet, terroir.parquet
 │   └── processed/          # final feature parquets (train/test/future_vintage)
 ├── src/vininator/
@@ -319,7 +319,7 @@ vininator/
 │   │   ├── load.py         # X-Wines loader
 │   │   └── geocode.py      # region → lat/lon (cached)
 │   ├── features/
-│   │   ├── climate.py      # ERA5 → GDD, precip, anomalies
+│   │   ├── climate.py      # Open-Meteo → GDD, precip, anomalies
 │   │   ├── soil.py         # SoilGrids + DEM → CaCO3, pH, texture, slope, ...
 │   │   ├── terroir.py      # join climate + soil into the terroir block
 │   │   ├── text.py         # parse body/acidity/tannin/flavors from notes
@@ -337,7 +337,7 @@ vininator/
 │   │   ├── routes.py
 │   │   ├── schemas.py
 │   │   ├── service.py      # wraps trained models, single source of inference
-│   │   └── terroir_provider.py  # cache-first live ERA5 + SoilGrids fetcher
+│   │   └── terroir_provider.py  # cache-first live Open-Meteo + SoilGrids fetcher
 │   └── cli.py              # typer CLI: vininator train rating, etc.
 ├── frontend/
 │   ├── package.json
@@ -364,7 +364,7 @@ vininator/
 | Data wrangling | `polars` | Faster than pandas at 800k rows; lazy is nice |
 | Modeling | `catboost` | Native categorical support; no manual encoding |
 | Text | `sentence-transformers`, `re` | MiniLM for embeddings; regex for body/acidity parsing |
-| Weather | `cdsapi` (Copernicus CDS) | Free ERA5 access |
+| Weather | Open-Meteo Historical Weather API | ERA5-Land via clean JSON REST, no auth |
 | Soil | SoilGrids REST API (ISRIC) | Free, no auth, global 250 m coverage |
 | Terrain | SRTM 30 m via `elevation` or Open-Elevation | Free; elevation + slope per centroid |
 | Geocoding | `geopy` (Nominatim) | Free; respect rate limits |
@@ -378,7 +378,8 @@ vininator/
 
 ## 7. Realistic things to know
 
-- **ERA5 pulls take ~3–6 hours.** Per-region multi-year daily, concurrency capped at 8, exponential backoff on 429/5xx, resume-from-disk. The cache *is* the state — a half-finished run restarts cleanly. ERA5 attribution must be embedded in derived artifacts; raw NetCDF tiles are not for redistribution.
+- **Open-Meteo pulls take ~12 minutes sequentially.** One HTTP request per region (~1,377 total after the geocode blacklist), polite 0.5s spacing, exponential backoff on 429/5xx, resume-from-disk per JSON file. The cache *is* the state — a half-finished run restarts cleanly. Attribution must be embedded in derived artifacts (Open-Meteo CC BY 4.0 + upstream ERA5-Land lineage). Free tier is non-commercial only; Vininator is a personal/learning project. If the free tier ever breaks for us, Copernicus CDS direct is the documented fallback path — same ERA5-Land data, just much chunkier.
+- **Climatology window is 1991–2018, not the WMO-standard 1991–2020.** The baseline used to compute climate anomalies ends at the training cutoff so the anomaly column contains zero information about the 2019–2021 future-vintage holdout. Reporting that "the model generalizes to future vintages" would be a lie if the anomalies it trained on already peeked at those vintages.
 - **SoilGrids is fast but flaky.** Single-pixel queries can be noisy and the endpoint occasionally 5xxs. Always buffer-and-average, always retry with backoff, always cache.
 - **Geocoding has rate limits.** Nominatim asks for 1 req/sec. A few thousand regions is fine, just plan for it.
 - **Geocode `result_type` lies sometimes.** Nominatim happily resolves a wine-region string to a city, monument, or random POI when the appellation isn't in OSM under that exact name. The resulting `status='ok'` row points at the wrong place, and SoilGrids returns null on top of that wrong location. Audit the `result_type` distribution after the geocode pull and filter to a known-good whitelist (administrative / region / locality / hamlet / etc.) before training. Examples encountered in PR2 smoke: "Buenos Aires" → `city`, "Scanderbeg" → `square`.

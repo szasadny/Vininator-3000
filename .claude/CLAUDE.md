@@ -2,7 +2,7 @@
 
 ## Domain
 
-ML project that predicts Vivino-style wine ratings and tasting notes from grape, region, vintage, and producer — augmented with a **terroir feature block** that combines ERA5 climate reanalysis per `(region, vintage_year)` with SoilGrids soil/terrain properties per `region`.
+ML project that predicts Vivino-style wine ratings and tasting notes from grape, region, vintage, and producer — augmented with a **terroir feature block** that combines ERA5-Land climate reanalysis (via Open-Meteo) per `(region, vintage_year)` with SoilGrids soil/terrain properties per `region`.
 
 Primary dataset: **WineSensed** (`Dakhoo/L2T-NeurIPS-2023` on HuggingFace, CC BY-NC-ND 4.0). ~824k Vivino reviews, ~40k with full structured attributes (the real working set).
 
@@ -18,7 +18,7 @@ For the full plan, phases, and sequencing, see [PROJECT.md](./PROJECT.md). That 
 | Env / deps | `uv` (lockfile committed) |
 | Data | `polars` (preferred over pandas for the main tables) |
 | ML | `catboost` (primary), `scikit-learn` (utilities), `sentence-transformers` (text embeddings) |
-| Weather | `cdsapi` → ERA5 reanalysis (Copernicus CDS) |
+| Weather | Open-Meteo Historical Weather API (ERA5-Land lineage, JSON, no auth) |
 | Soil | SoilGrids REST API (ISRIC), no auth |
 | Terrain | SRTM 30 m via `elevation` or Open-Elevation |
 | Geocoding | `geopy` (Nominatim) |
@@ -35,10 +35,10 @@ For the full plan, phases, and sequencing, see [PROJECT.md](./PROJECT.md). That 
 ```text
 src/vininator/
   data/         # WineSensed loader, geocoding (cached, resumable)
-  features/     # climate.py (ERA5 → GDD/precip/anomalies), soil.py, terroir.py (joiner), text.py (parse body/acidity/flavors), build.py (assemble final table)
+  features/     # climate.py (Open-Meteo → GDD/precip/anomalies), soil.py, terroir.py (joiner), text.py (parse body/acidity/flavors), build.py (assemble final table)
   models/       # rating.py, profile.py, tags.py, notes.py — one file per target (notes is retrieval-only, no generative)
   eval/         # metrics, ablations, SHAP
-  api/          # FastAPI app (main, routes, schemas, service, terroir_provider — cache-first live ERA5 + SoilGrids fetch)
+  api/          # FastAPI app (main, routes, schemas, service, terroir_provider — cache-first live Open-Meteo + SoilGrids fetch)
   cli.py        # typer CLI entrypoint: `vininator train rating`, etc.
 
 frontend/src/
@@ -48,7 +48,7 @@ frontend/src/
   pages/        # one folder per route
 
 data/
-  raw/          # WineSensed dump, ERA5 daily pulls, SoilGrids responses — never modified after write
+  raw/          # WineSensed dump, Open-Meteo JSON pulls, SoilGrids responses — never modified after write
   interim/      # geocoded regions, climate.parquet, soil.parquet, terroir.parquet
   processed/    # final feature parquets (train/test/future_vintage)
 
@@ -91,12 +91,12 @@ These are the rules that protect the *headline result*. They are non-negotiable.
 - **Split by `wine_id`, not by review.** Same wine in train and test is leakage. Every split function in `src/vininator/data/` must enforce this.
 - **Future-vintage holdout.** In addition to the random wine-id split, hold out vintages 2019–2021 as a separate test set. This is how we tell whether the model learned terroir or just memorized region averages.
 - **No target leakage in producer aggregates.** Producer mean-rating / std / n_reviews features are computed **on the training fold only**, then applied to test. Never compute on the full dataset.
-- **Cache every external call.** ERA5 and Nominatim are slow, rate-limited, and intermittently fail. Every external fetch goes through a function that checks a parquet/sqlite cache first, writes the result, and is resumable across restarts.
+- **Cache every external call.** Open-Meteo, SoilGrids, and Nominatim are all rate-limited and intermittently fail. Every external fetch goes through a function that checks a parquet/sqlite/json cache first, writes the result atomically, and is resumable across restarts.
 - **Raw data is immutable.** Files in `data/raw/` are never modified after write. Cleaning and joining happen on the way to `data/interim/` and `data/processed/`.
 - **Track every experiment.** MLflow/W&B from run #1. Hyperparameters, dataset hash, git SHA, metrics, feature list — all logged. "I'll start tracking once it works" never happens.
 - **Report ablations honestly.** The headline experiment compares rating-with-terroir vs. rating-without. If terroir adds 1% RMSE, that's the result — don't bury it.
 - **Sample weighting.** Use `log(1 + n_ratings)` per wine. A wine with 5000 ratings is a different signal than a wine with 5.
-- **Live serving needs the same features as training.** The model is trained on historical vintages but the API must answer for any `(region, vintage_year)` — including this year's. All on-demand terroir fetches go through `api/terroir_provider.py`, which is cache-first (in-process LRU → SQLite → R2/B2 → live ERA5 + SoilGrids). Inference paths never reach the upstream APIs directly.
+- **Live serving needs the same features as training.** The model is trained on historical vintages but the API must answer for any `(region, vintage_year)` — including this year's. All on-demand terroir fetches go through `api/terroir_provider.py`, which is cache-first (in-process LRU → SQLite → R2/B2 → live Open-Meteo + SoilGrids). Inference paths never reach the upstream APIs directly.
 
 ---
 
@@ -106,7 +106,7 @@ Before implementing something in-house, check whether a stable, maintained libra
 
 - **Boosted trees** → `catboost`. Native categoricals (don't manually target-encode).
 - **Text embeddings** → `sentence-transformers`. Don't train your own.
-- **Weather data** → `cdsapi` against ERA5. Don't scrape weather sites.
+- **Weather data** → Open-Meteo Historical Weather API. ERA5-Land quality without CDS friction. Don't scrape weather sites; don't reach for raw NetCDF / xarray when a clean JSON wrapper exists.
 - **Geocoding** → `geopy` with Nominatim. Don't write a CSV of regions by hand.
 - **Experiment tracking** → MLflow or W&B. Don't roll your own logging.
 - **API framework** → FastAPI. Don't hand-write a Flask service.
@@ -143,7 +143,7 @@ Write code for the developer maintaining it 12 months from now.
 - Grep for the existing pattern before writing new code — match it exactly.
 - If a stable external library solves the problem, prefer it.
 - **Ask when genuinely split.** If two architecturally sound options exist with real trade-offs (e.g., "store the cache as parquet or sqlite"), present them and ask. Don't pick arbitrarily.
-- **Ask before assuming on external resources.** If the task needs a CDS API key, HuggingFace token, or a downloaded artifact that isn't in the repo, stop and ask — don't write code that silently fails on a missing credential.
+- **Ask before assuming on external resources.** If the task needs a HuggingFace token or a downloaded artifact that isn't in the repo, stop and ask — don't write code that silently fails on a missing credential.
 
 **While writing:**
 
