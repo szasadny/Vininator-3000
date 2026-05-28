@@ -1,7 +1,7 @@
 [project]
 name = "vininator"
 version = "0.1.0"
-description = "Wine rating and tasting-notes predictor combining WineSensed reviews with ERA5 climate and SoilGrids terroir features."
+description = "Wine rating and tasting-notes predictor combining X-Wines reviews with NASA POWER climate and SoilGrids terroir features."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
@@ -14,6 +14,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "geopy>=2.4",
     "requests>=2.32",
+    "tzdata>=2026.2",
 ]
 
 [project.scripts]

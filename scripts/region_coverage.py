@@ -41,7 +41,7 @@ def main() -> None:
         print(f"  {int(t*100):>2}%  ->  top {n:>5} regions  "
               f"(last region added: {idx['RegionName'][0]!r}, {int(idx['n_ratings'][0]):,} ratings)")
 
-    # And how this translates to (region, vintage) cells eligible for ERA5.
+    # And how this translates to (region, vintage) cells eligible for NASA POWER.
     print("\n(region, vintage) cell counts for the top-N regions:")
     cells_full = (
         joined.filter(pl.col("Vintage").is_not_null())

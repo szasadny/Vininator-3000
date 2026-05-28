@@ -1,16 +1,19 @@
-"""Per-region climate features for the terroir block (Open-Meteo Historical).
+"""Per-region climate features for the terroir block (NASA POWER Daily).
 
-Phase 2 step 3. We pull the Open-Meteo Historical Weather API — a free,
-JSON-only wrapper around ERA5-Land reanalysis (0.1° / ~11 km) — for every
-usable region, fetching all of `CLIMATE_YEAR_RANGE` and all five daily
-variables in a single HTTP request per region. The response lands as JSON
-under `data/raw/open_meteo/{slug}.json`; that file *is* the resume state —
+Phase 2 step 3. We pull the NASA POWER Daily API — a free, public-domain
+REST/JSON endpoint that serves MERRA-2 temperature/precipitation and CERES
+SYN1DEG solar radiation at ~0.5° / ~55 km resolution — for every usable
+region, fetching all of `CLIMATE_YEAR_RANGE` and all five daily variables
+in a single HTTP request per region. The response lands as JSON under
+`data/raw/nasa_power/{slug}.json`; that file *is* the resume state —
 restart picks up wherever the disk says it left off.
 
 Separation of concerns mirrors soil.py:
 
-- `fetch_open_meteo_region`: I/O, cached, network-aware. Atomic tmp→rename.
-- `load_open_meteo_daily`: pure (no network), JSON → daily polars DataFrame.
+- `fetch_nasa_power_region`: I/O, cached, network-aware. Atomic tmp→rename.
+- `load_nasa_power_daily`: pure (no network), JSON → daily polars DataFrame.
+  Coerces POWER's `-999.0` fill value to null so downstream nullability
+  semantics match what the feature math expects.
 - `compute_climate_features`: pure, applies growing-season mask + derives the
   7 absolute features. Marks `is_partial=True` if growing-season days are
   missing.
@@ -25,9 +28,12 @@ The same pure functions are reused at inference time by Phase 7's
 `TerroirProvider`, so any change to the feature math must hold for batch AND
 online — never compute features inline at serve time.
 
-Why Open-Meteo over Copernicus CDS? Same underlying ERA5-Land data, but just
-1,377 HTTP specific requests instead of 8.3k–128k chunked CDS calls that need to be aggregated. Attribution is
-embedded in the parquet metadata.
+Why NASA POWER over Open-Meteo (the previous backend)? Open-Meteo's free
+tier turned out to bill per data point — 30 years × 5 vars in a single
+coordinate exceeded its daily quota. POWER is free without per-point
+metering. The cost is resolution: ~55 km cells instead of ~11 km, which
+matters less than it sounds because region centroids are already a much
+coarser approximation of the actual vineyard parcel.
 """
 
 from __future__ import annotations
@@ -56,12 +62,14 @@ from vininator.config import (
     GROWING_SEASON_SH_VINTAGE,
     HARVEST_WINDOW_DAYS,
     HEAT_SPIKE_TMAX_C,
-    OPEN_METEO_ATTRIBUTION,
-    OPEN_METEO_BACKOFF_SEC,
-    OPEN_METEO_BASE_URL,
-    OPEN_METEO_DAILY_VARS,
-    OPEN_METEO_RATE_LIMIT_SEC,
-    OPEN_METEO_TIMEOUT_SEC,
+    NASA_POWER_ATTRIBUTION,
+    NASA_POWER_BACKOFF_SEC,
+    NASA_POWER_BASE_URL,
+    NASA_POWER_COMMUNITY,
+    NASA_POWER_DAILY_VARS,
+    NASA_POWER_FILL_VALUE,
+    NASA_POWER_RATE_LIMIT_SEC,
+    NASA_POWER_TIMEOUT_SEC,
     SPRING_FROST_MONTHS_NH,
     SPRING_FROST_MONTHS_SH,
     get_settings,
@@ -71,7 +79,7 @@ from vininator.features.soil import region_slug
 
 # Production fetcher takes (params dict, target path) and writes the raw JSON
 # response. Tests inject a stub that synthesises a response dict and writes it.
-OpenMeteoFetchFn = Callable[[dict[str, Any], Path], None]
+NasaPowerFetchFn = Callable[[dict[str, Any], Path], None]
 ProgressFn = Callable[[int, int], None]
 NotifyFn = Callable[[str], None]
 SleepFn = Callable[[float], None]
@@ -114,16 +122,8 @@ CLIMATOLOGY_SCHEMA: dict[str, pl.DataType] = {
 }
 
 
-class OpenMeteoError(RuntimeError):
-    """Raised when an Open-Meteo request fails permanently (after retries)."""
-
-
-class _RateLimited(Exception):  # internal, never escapes the retry loop
-    """429 from Open-Meteo. Carries the server's `Retry-After` hint if present."""
-
-    def __init__(self, retry_after_sec: float | None) -> None:
-        self.retry_after_sec = retry_after_sec
-        super().__init__(f"rate limited (Retry-After={retry_after_sec})")
+class NasaPowerError(RuntimeError):
+    """Raised when a NASA POWER request fails permanently (after retries)."""
 
 
 # ---------------------------------------------------------------------------
@@ -188,45 +188,75 @@ def _spring_frost_window(lat: float, vintage_year: int) -> tuple[date, date]:
 # ---------------------------------------------------------------------------
 
 
-def load_open_meteo_daily(json_path: Path) -> pl.DataFrame:
-    """Parse an Open-Meteo JSON cache file into a daily polars frame.
+def load_nasa_power_daily(json_path: Path) -> pl.DataFrame:
+    """Parse a NASA POWER JSON cache file into a daily polars frame.
 
-    Output schema: `date, tmin_c, tmean_c, tmax_c, precip_mm, ssrd_mj`.
+    Output schema: `date, tmin_c, tmean_c, tmax_c, precip_mm, ssrd_mj` —
+    the same shape and units `compute_climate_features` consumes, so the
+    feature math is source-agnostic.
 
-    Open-Meteo's response shape:
+    NASA POWER's response shape:
         {
-          "latitude": ..., "longitude": ...,
-          "daily": {
-            "time": ["1991-01-01", ...],
-            "temperature_2m_min": [...], "temperature_2m_mean": [...],
-            "temperature_2m_max": [...], "precipitation_sum": [...],
-            "shortwave_radiation_sum": [...]
-          }
+          "properties": {
+            "parameter": {
+              "T2M":               {"19910101": 1.9, ...},
+              "T2M_MIN":           {...},
+              "T2M_MAX":           {...},
+              "PRECTOTCORR":       {...},
+              "ALLSKY_SFC_SW_DWN": {...}
+            }
+          },
+          "header": {"fill_value": -999.0, ...}
         }
 
-    Units already match what `compute_climate_features` expects (°C, mm, MJ/m²).
-    Nulls in any array land as nulls in the polars frame — `compute_climate_features`
-    will then surface them as `is_partial=True` if they fall in the growing season.
+    Dict keys are `YYYYMMDD` strings (not an array as Open-Meteo used). POWER
+    reports `-999.0` for days where source data was unavailable; this parser
+    coerces those sentinels to null *before* polars sees them, so
+    `compute_climate_features` sees missing growing-season days as null and
+    flags the row `is_partial=True` exactly as before.
 
     Pure — no network, no global state.
     """
     payload = json.loads(json_path.read_text(encoding="utf-8"))
-    daily = payload.get("daily")
-    if not daily or not daily.get("time"):
-        raise ValueError(f"Open-Meteo JSON at {json_path} has no daily.time array")
+    parameter = payload.get("properties", {}).get("parameter")
+    if not parameter or not parameter.get("T2M"):
+        raise ValueError(
+            f"NASA POWER JSON at {json_path} has no properties.parameter.T2M data"
+        )
+
+    fill = float(payload.get("header", {}).get("fill_value", NASA_POWER_FILL_VALUE))
+
+    def _coerce(value: float | int | None) -> float | None:
+        """`-999.0` → null; preserve everything else as float.
+
+        Use a small tolerance because POWER occasionally serializes the
+        sentinel as `-999` (int) and we don't want a float-equality miss to
+        leak the fill value into downstream sums.
+        """
+        if value is None:
+            return None
+        return None if abs(float(value) - fill) < 1e-3 else float(value)
+
+    # T2M's dates are the canonical timeline; all five parameter dicts
+    # cover the same span in lockstep, per the POWER API contract.
+    date_keys = sorted(parameter["T2M"].keys())
+
+    def _series(var_name: str) -> list[float | None]:
+        column = parameter.get(var_name, {})
+        return [_coerce(column.get(d)) for d in date_keys]
 
     return (
         pl.DataFrame(
             {
-                "date": daily["time"],
-                "tmin_c": daily.get("temperature_2m_min", []),
-                "tmean_c": daily.get("temperature_2m_mean", []),
-                "tmax_c": daily.get("temperature_2m_max", []),
-                "precip_mm": daily.get("precipitation_sum", []),
-                "ssrd_mj": daily.get("shortwave_radiation_sum", []),
+                "date": date_keys,
+                "tmin_c": _series("T2M_MIN"),
+                "tmean_c": _series("T2M"),
+                "tmax_c": _series("T2M_MAX"),
+                "precip_mm": _series("PRECTOTCORR"),
+                "ssrd_mj": _series("ALLSKY_SFC_SW_DWN"),
             }
         )
-        .with_columns(pl.col("date").str.to_date("%Y-%m-%d"))
+        .with_columns(pl.col("date").str.to_date("%Y%m%d"))
         .sort("date")
     )
 
@@ -362,96 +392,84 @@ def compute_climatology(
 # ---------------------------------------------------------------------------
 
 
-def _open_meteo_params(lat: float, lon: float) -> dict[str, Any]:
+def _nasa_power_params(lat: float, lon: float) -> dict[str, Any]:
     """Build the query-string dict for one (lat, lon) region request."""
     start_year, end_year = CLIMATE_YEAR_RANGE
     return {
-        "latitude": lat,
+        "parameters": ",".join(NASA_POWER_DAILY_VARS),
+        "community": NASA_POWER_COMMUNITY,
         "longitude": lon,
-        "start_date": f"{start_year}-01-01",
-        "end_date": f"{end_year}-12-31",
-        "daily": ",".join(OPEN_METEO_DAILY_VARS),
-        "timezone": "UTC",
+        "latitude": lat,
+        "start": f"{start_year}0101",
+        "end": f"{end_year}1231",
+        "format": "JSON",
     }
 
 
-def fetch_open_meteo_region(
+def fetch_nasa_power_region(
     region: str,
     country: str | None,
     lat: float,
     lon: float,
     *,
     force: bool = False,
-    fetch_fn: OpenMeteoFetchFn | None = None,
+    fetch_fn: NasaPowerFetchFn | None = None,
     notify_fn: NotifyFn | None = None,
     sleep_fn: SleepFn = time.sleep,
 ) -> Path:
-    """Fetch all years for one region from Open-Meteo, cache the JSON, return its path.
+    """Fetch all years for one region from NASA POWER, cache the JSON, return its path.
 
-    Cache lives at `data/raw/open_meteo/{slug}.json`. On hit (file exists,
+    Cache lives at `data/raw/nasa_power/{slug}.json`. On hit (file exists,
     non-empty, `force=False`) the network is never touched — that's the resume
     mechanism. Atomic writes via `tmp → rename` so a Ctrl+C mid-download never
     leaves a half-written `.json` behind.
 
-    Transient failures (network blips, 429, 5xx) retry with exponential
-    backoff per `OPEN_METEO_BACKOFF_SEC`. Persistent failures raise
-    `OpenMeteoError`.
+    Transient failures (network blips, 5xx, network-layer aborts) retry with
+    exponential backoff per `NASA_POWER_BACKOFF_SEC`. Persistent failures
+    raise `NasaPowerError`. Unlike Open-Meteo, POWER does not return a
+    structured 429 with a `Retry-After` header — the docs warn that abusive
+    callers get opaquely blocked, so politeness is upstream of retry logic
+    via `NASA_POWER_RATE_LIMIT_SEC` in `build_climate_table`.
     """
     slug = region_slug(region, country)
-    cache_path = get_settings().open_meteo_raw_dir / f"{slug}.json"
+    cache_path = get_settings().nasa_power_raw_dir / f"{slug}.json"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not force and cache_path.exists() and cache_path.stat().st_size > 0:
         return cache_path
 
     if fetch_fn is None:
-        fetch_fn = _default_open_meteo_fetch_fn
+        fetch_fn = _default_nasa_power_fetch_fn
 
     tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    params = _open_meteo_params(lat, lon)
+    params = _nasa_power_params(lat, lon)
 
     def _notify(msg: str) -> None:
         if notify_fn is not None:
             notify_fn(msg)
 
     last_exc: Exception | None = None
-    for attempt in range(len(OPEN_METEO_BACKOFF_SEC) + 1):
+    for attempt in range(len(NASA_POWER_BACKOFF_SEC) + 1):
         try:
-            _notify(f"... Open-Meteo {region!r} attempt {attempt + 1}")
+            _notify(f"... NASA POWER {region!r} attempt {attempt + 1}")
             fetch_fn(params, tmp_path)
             if not tmp_path.exists() or tmp_path.stat().st_size == 0:
-                raise RuntimeError(f"Open-Meteo produced empty file at {tmp_path}")
+                raise RuntimeError(f"NASA POWER produced empty file at {tmp_path}")
             os.replace(tmp_path, cache_path)
             return cache_path
-        except OpenMeteoError:
+        except NasaPowerError:
             _cleanup_tmp(tmp_path)
             raise
-        except _RateLimited as exc:
-            last_exc = exc
-            _cleanup_tmp(tmp_path)
-            if attempt < len(OPEN_METEO_BACKOFF_SEC):
-                # Prefer the server's hint; fall back to our schedule if absent.
-                delay = (
-                    exc.retry_after_sec
-                    if exc.retry_after_sec is not None
-                    else OPEN_METEO_BACKOFF_SEC[attempt]
-                )
-                _notify(
-                    f"... Open-Meteo 429 {region!r}; "
-                    f"sleeping {delay:.1f}s "
-                    f"({'Retry-After' if exc.retry_after_sec is not None else 'fallback'})"
-                )
-                sleep_fn(delay)
         except Exception as exc:  # noqa: BLE001 — retry policy is the catch-all
             last_exc = exc
             _cleanup_tmp(tmp_path)
-            if attempt < len(OPEN_METEO_BACKOFF_SEC):
-                delay = OPEN_METEO_BACKOFF_SEC[attempt]
-                _notify(f"... Open-Meteo error {exc!r}; retrying in {delay:.1f}s")
+            if attempt < len(NASA_POWER_BACKOFF_SEC):
+                delay = NASA_POWER_BACKOFF_SEC[attempt]
+                _notify(f"... NASA POWER error {exc!r}; retrying in {delay:.1f}s")
                 sleep_fn(delay)
     assert last_exc is not None
-    raise OpenMeteoError(
-        f"Open-Meteo failed for {region!r} after {len(OPEN_METEO_BACKOFF_SEC) + 1} "
+    raise NasaPowerError(
+        f"NASA POWER failed for {region!r} after {len(NASA_POWER_BACKOFF_SEC) + 1} "
         f"attempts. Last error: {last_exc}"
     ) from last_exc
 
@@ -464,36 +482,24 @@ def _cleanup_tmp(tmp_path: Path) -> None:
         pass
 
 
-def _default_open_meteo_fetch_fn(params: dict[str, Any], target: Path) -> None:
-    """Production fetcher: GET the archive endpoint, write the JSON to `target`.
+def _default_nasa_power_fetch_fn(params: dict[str, Any], target: Path) -> None:
+    """Production fetcher: GET the POWER daily endpoint, write JSON to `target`.
 
-    On HTTP 429 we lift the response's `Retry-After` header into a
-    `_RateLimited` exception so the retry loop can honor the server's specific
-    wait time instead of guessing with our fallback backoff.
+    Non-2xx responses become `NasaPowerError` directly — POWER returns plain
+    HTTP errors for 5xx, and any 4xx points at a programming bug (bad params)
+    that retrying won't fix.
     """
     response = requests.get(
-        OPEN_METEO_BASE_URL,
+        NASA_POWER_BASE_URL,
         params=params,
-        timeout=OPEN_METEO_TIMEOUT_SEC,
+        timeout=NASA_POWER_TIMEOUT_SEC,
         headers={"User-Agent": "vininator-3000/0.1"},
     )
-    if response.status_code == 429:
-        raise _RateLimited(_parse_retry_after(response.headers.get("Retry-After")))
-    response.raise_for_status()
+    if not response.ok:
+        raise NasaPowerError(
+            f"HTTP {response.status_code} from {response.url}: {response.text[:500]}"
+        )
     _write_json_atomic_text(response.text, target)
-
-
-def _parse_retry_after(value: str | None) -> float | None:
-    """Open-Meteo sends `Retry-After` as integer seconds. RFC 7231 also allows
-    HTTP-dates but we don't see those from this API; if we ever do, fall back
-    to the default backoff schedule by returning None.
-    """
-    if not value:
-        return None
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        return None
 
 
 def _write_json_atomic_text(text: str, target: Path) -> None:
@@ -568,15 +574,15 @@ def _row_from_features(
 def build_climate_table(
     force: bool = False,
     limit: int | None = None,
-    fetch_fn: OpenMeteoFetchFn | None = None,
+    fetch_fn: NasaPowerFetchFn | None = None,
     progress_fn: ProgressFn | None = None,
     notify_fn: NotifyFn | None = None,
     sleep_fn: SleepFn = time.sleep,
 ) -> Path:
     """Build `data/interim/climate.parquet` for every usable region × vintage.
 
-    Iterates `filter_to_usable(geocode)` rows, fetches one Open-Meteo JSON per
-    region via `fetch_open_meteo_region` (cache-first), computes climatology
+    Iterates `filter_to_usable(geocode)` rows, fetches one NASA POWER JSON per
+    region via `fetch_nasa_power_region` (cache-first), computes climatology
     over `CLIMATOLOGY_WINDOW`, then writes one row per `(region, vintage_year)`
     in `CLIMATE_YEAR_RANGE`. Resume-aware: regions whose rows already exist
     in the parquet are skipped via an anti-join on `(region, country)`.
@@ -585,11 +591,12 @@ def build_climate_table(
     rows from prior partial runs are kept and only missing regions are
     processed.
 
-    Sequential. Open-Meteo's free tier allows up to 10k requests/day with no
-    per-second hard cap; we politely space requests by `OPEN_METEO_RATE_LIMIT_SEC`.
-    A future PR can lift this to a thread pool if wall-time matters.
+    Sequential. POWER has no published hard rate limit but the API docs warn
+    that hammering the same endpoint may result in blocking; we politely
+    space requests by `NASA_POWER_RATE_LIMIT_SEC`. A future PR can lift this
+    to a thread pool if wall-time matters.
 
-    `OpenMeteoError` propagates immediately — it indicates persistent API
+    `NasaPowerError` propagates immediately — it indicates persistent API
     failure that will hit every other region the same way.
     """
     settings = get_settings()
@@ -627,22 +634,22 @@ def build_climate_table(
         # Polite per-request spacing; cache hits skip the sleep so an all-cached
         # re-run is instant.
         cache_path = (
-            settings.open_meteo_raw_dir
+            settings.nasa_power_raw_dir
             / f"{region_slug(row['region'], row['country'])}.json"
         )
         cache_hit = cache_path.exists() and cache_path.stat().st_size > 0
         if i > 1 and not cache_hit:
-            sleep_fn(OPEN_METEO_RATE_LIMIT_SEC)
+            sleep_fn(NASA_POWER_RATE_LIMIT_SEC)
 
         _notify(f"... climate {i}/{total}: {row['region']!r}, {row['country']!r}")
         region_rows: list[dict[str, Any]] = []
         try:
-            json_path = fetch_open_meteo_region(
+            json_path = fetch_nasa_power_region(
                 row["region"], row["country"], row["lat"], row["lon"],
                 force=force, fetch_fn=fetch_fn, notify_fn=notify_fn,
                 sleep_fn=sleep_fn,
             )
-            daily = load_open_meteo_daily(json_path)
+            daily = load_nasa_power_daily(json_path)
             daily_by_year = _split_daily_by_year(daily)
             climatology = compute_climatology(
                 daily_by_year, row["lat"], CLIMATOLOGY_WINDOW
@@ -655,7 +662,7 @@ def build_climate_table(
                         year, features, climatology,
                     )
                 )
-        except OpenMeteoError:
+        except NasaPowerError:
             raise
         except Exception as exc:  # noqa: BLE001 — bad region shouldn't kill the run
             _notify(f"!!! climate {row['region']!r} failed: {exc!r}")
@@ -699,7 +706,7 @@ def _write_parquet_atomic(df: pl.DataFrame, target: Path) -> None:
     tmp = target.with_suffix(target.suffix + ".tmp")
     df.write_parquet(
         tmp,
-        # Embed the Open-Meteo attribution in the parquet metadata.
-        metadata={"source": OPEN_METEO_ATTRIBUTION},
+        # Embed the NASA POWER attribution in the parquet metadata.
+        metadata={"source": NASA_POWER_ATTRIBUTION},
     )
     tmp.replace(target)

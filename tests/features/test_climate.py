@@ -1,6 +1,6 @@
-"""Tests for the climate feature module (Open-Meteo Historical).
+"""Tests for the climate feature module (NASA POWER Daily).
 
-All tests are offline. The stub `fetch_fn` writes a hand-built Open-Meteo
+All tests are offline. The stub `fetch_fn` writes a hand-built NASA POWER
 JSON response to the target path, exercising the full fetch→load→compute
 pipeline without ever hitting the network. Pure-function tests for the
 feature math operate on locally-built polars frames.
@@ -18,19 +18,22 @@ import pytest
 from vininator.config import (
     CLIMATE_YEAR_RANGE,
     CLIMATOLOGY_WINDOW,
-    OPEN_METEO_DAILY_VARS,
+    NASA_POWER_BACKOFF_SEC,
+    NASA_POWER_COMMUNITY,
+    NASA_POWER_DAILY_VARS,
+    NASA_POWER_FILL_VALUE,
     get_settings,
 )
 from vininator.data.geocode import GEOCODE_SCHEMA
 from vininator.features.climate import (
     CLIMATE_SCHEMA,
-    OpenMeteoError,
+    NasaPowerError,
     _growing_season_window,
     build_climate_table,
     compute_climate_features,
     compute_climatology,
-    fetch_open_meteo_region,
-    load_open_meteo_daily,
+    fetch_nasa_power_region,
+    load_nasa_power_daily,
 )
 from vininator.features.soil import region_slug
 
@@ -66,7 +69,7 @@ def _daily_frame_for_year(
     )
 
 
-def _make_open_meteo_payload(
+def _make_nasa_power_payload(
     year_range: tuple[int, int],
     *,
     tmin_c: float = 12.0,
@@ -78,7 +81,7 @@ def _make_open_meteo_payload(
     lat: float = 45.0,
     lon: float = 3.0,
 ) -> dict:
-    """Build an Open-Meteo-shaped JSON payload covering `year_range` inclusive.
+    """Build a NASA POWER-shaped JSON payload covering `year_range` inclusive.
 
     `per_year_tmean` lets a test pin a specific tmean for individual years
     (e.g. mark 2003 as a heat-wave) while keeping the rest uniform.
@@ -87,35 +90,54 @@ def _make_open_meteo_payload(
     start_date = date(start_y, 1, 1)
     end_date = date(end_y, 12, 31)
     n_days = (end_date - start_date).days + 1
-    dates = [(start_date + timedelta(days=i)).isoformat() for i in range(n_days)]
-    tmeans = []
+
+    t2m: dict[str, float] = {}
+    t2m_min: dict[str, float] = {}
+    t2m_max: dict[str, float] = {}
+    prect: dict[str, float] = {}
+    sw: dict[str, float] = {}
     for i in range(n_days):
         d = start_date + timedelta(days=i)
-        tmeans.append(
+        key = d.strftime("%Y%m%d")
+        t2m[key] = (
             per_year_tmean.get(d.year, tmean_c) if per_year_tmean else tmean_c
         )
+        t2m_min[key] = tmin_c
+        t2m_max[key] = tmax_c
+        prect[key] = precip_mm
+        sw[key] = ssrd_mj
+
     return {
-        "latitude": lat,
-        "longitude": lon,
-        "daily": {
-            "time": dates,
-            "temperature_2m_min": [tmin_c] * n_days,
-            "temperature_2m_mean": tmeans,
-            "temperature_2m_max": [tmax_c] * n_days,
-            "precipitation_sum": [precip_mm] * n_days,
-            "shortwave_radiation_sum": [ssrd_mj] * n_days,
+        "type": "Feature",
+        "geometry": {"type": "Point", "coordinates": [lon, lat, 0.0]},
+        "properties": {
+            "parameter": {
+                "T2M": t2m,
+                "T2M_MIN": t2m_min,
+                "T2M_MAX": t2m_max,
+                "PRECTOTCORR": prect,
+                "ALLSKY_SFC_SW_DWN": sw,
+            }
+        },
+        "header": {"fill_value": NASA_POWER_FILL_VALUE},
+        "parameters": {
+            "T2M": {"units": "C"},
+            "T2M_MIN": {"units": "C"},
+            "T2M_MAX": {"units": "C"},
+            "PRECTOTCORR": {"units": "mm/day"},
+            "ALLSKY_SFC_SW_DWN": {"units": "MJ/m^2/day"},
         },
     }
 
 
-def _stub_open_meteo_fetch(params: dict, target: Path) -> None:
-    """Default stub: write a uniform Open-Meteo payload covering the
+def _stub_nasa_power_fetch(params: dict, target: Path) -> None:
+    """Default stub: write a uniform NASA POWER payload covering the
     requested date range. Every region produces identical features, so
     build-table tests reduce to row presence + schema checks.
     """
-    start_year = int(params["start_date"].split("-", 1)[0])
-    end_year = int(params["end_date"].split("-", 1)[0])
-    payload = _make_open_meteo_payload(
+    start_year = int(params["start"][:4])
+    end_year = int(params["end"][:4])
+    payload = _make_nasa_power_payload(
         (start_year, end_year),
         lat=float(params["latitude"]),
         lon=float(params["longitude"]),
@@ -216,8 +238,9 @@ def test_compute_climate_features_is_partial_on_missing_days() -> None:
 def test_compute_climate_features_is_partial_on_null_tmean() -> None:
     """Null tmean inside the season → is_partial=True even with full date coverage.
 
-    Open-Meteo backfills the most recent years over weeks and may return
-    explicit nulls for not-yet-published days. We must catch that.
+    NASA POWER reports -999.0 for days where source data was unavailable.
+    `load_nasa_power_daily` coerces that sentinel to null; this test confirms
+    the downstream null-detection works the same as before.
     """
     daily = _daily_frame_for_year(2018)
     daily = daily.with_columns(
@@ -281,7 +304,7 @@ def test_anomaly_is_absolute_minus_climatology_mean(tmp_data_dir: Path) -> None:
 
     def hot_2018_fetch(params: dict, target: Path) -> None:
         """Most years tmean=18°C; 2018 is hot at tmean=20°C."""
-        payload = _make_open_meteo_payload(
+        payload = _make_nasa_power_payload(
             CLIMATE_YEAR_RANGE, per_year_tmean={2018: 20.0},
             lat=float(params["latitude"]), lon=float(params["longitude"]),
         )
@@ -302,20 +325,20 @@ def test_anomaly_is_absolute_minus_climatology_mean(tmp_data_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# load_open_meteo_daily
+# load_nasa_power_daily
 # ---------------------------------------------------------------------------
 
 
-def test_load_open_meteo_daily_parses_payload(tmp_path: Path) -> None:
-    """JSON shape from Open-Meteo → polars frame with the right columns + dtypes."""
-    payload = _make_open_meteo_payload(
+def test_load_nasa_power_daily_parses_payload(tmp_path: Path) -> None:
+    """JSON shape from NASA POWER → polars frame with the right columns + dtypes."""
+    payload = _make_nasa_power_payload(
         (2020, 2021), tmin_c=8.0, tmean_c=15.0, tmax_c=22.0,
         precip_mm=1.0, ssrd_mj=18.0,
     )
     json_path = tmp_path / "region.json"
     json_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    daily = load_open_meteo_daily(json_path)
+    daily = load_nasa_power_daily(json_path)
     assert daily.columns == ["date", "tmin_c", "tmean_c", "tmax_c", "precip_mm", "ssrd_mj"]
     assert daily["date"].dtype == pl.Date
     # 366 (leap) + 365 = 731 days
@@ -328,46 +351,69 @@ def test_load_open_meteo_daily_parses_payload(tmp_path: Path) -> None:
     assert first["ssrd_mj"] == pytest.approx(18.0)
 
 
-def test_load_open_meteo_daily_errors_on_empty_payload(tmp_path: Path) -> None:
-    """No daily.time array → ValueError, not a silent empty frame."""
+def test_load_nasa_power_daily_coerces_fill_value_to_null(tmp_path: Path) -> None:
+    """POWER's -999.0 fill value lands as null in the polars frame.
+
+    Required so that null-aware downstream code (`is_partial`, climatology
+    skip) sees missing days as null rather than as a wildly negative real
+    measurement. Otherwise a single missing day in the growing season would
+    poison every aggregate that touched it (GDD, mean diurnal, etc.).
+    """
+    payload = _make_nasa_power_payload((2020, 2020))
+    # Knock out 2020-07-15 across all variables with POWER's fill sentinel.
+    fill_day = "20200715"
+    for var in ("T2M", "T2M_MIN", "T2M_MAX", "PRECTOTCORR", "ALLSKY_SFC_SW_DWN"):
+        payload["properties"]["parameter"][var][fill_day] = NASA_POWER_FILL_VALUE
+
+    json_path = tmp_path / "region.json"
+    json_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    daily = load_nasa_power_daily(json_path)
+    target = daily.filter(pl.col("date") == date(2020, 7, 15)).row(0, named=True)
+    for col in ("tmin_c", "tmean_c", "tmax_c", "precip_mm", "ssrd_mj"):
+        assert target[col] is None, f"{col} should be null for fill-value day"
+
+
+def test_load_nasa_power_daily_errors_on_empty_payload(tmp_path: Path) -> None:
+    """No properties.parameter.T2M → ValueError, not a silent empty frame."""
     json_path = tmp_path / "empty.json"
-    json_path.write_text(json.dumps({"latitude": 0, "longitude": 0}), encoding="utf-8")
-    with pytest.raises(ValueError, match="no daily.time"):
-        load_open_meteo_daily(json_path)
+    json_path.write_text(json.dumps({"properties": {"parameter": {}}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="no properties.parameter.T2M"):
+        load_nasa_power_daily(json_path)
 
 
 # ---------------------------------------------------------------------------
-# fetch_open_meteo_region
+# fetch_nasa_power_region
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_open_meteo_region_cache_hit_skips_network(tmp_data_dir: Path) -> None:
+def test_fetch_nasa_power_region_cache_hit_skips_network(tmp_data_dir: Path) -> None:
     """A pre-existing non-empty JSON cache → fetch_fn never called."""
     settings = get_settings()
-    cache = settings.open_meteo_raw_dir / f"{region_slug('TestRegion', 'Testland')}.json"
+    cache = settings.nasa_power_raw_dir / f"{region_slug('TestRegion', 'Testland')}.json"
     cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text("{\"daily\": {\"time\": []}}", encoding="utf-8")
+    cache.write_text("{\"properties\": {\"parameter\": {\"T2M\": {}}}}", encoding="utf-8")
 
     def must_not_call(params: dict, target: Path) -> None:
         raise AssertionError("fetch_fn should not be called on cache hit")
 
-    out = fetch_open_meteo_region(
+    out = fetch_nasa_power_region(
         "TestRegion", "Testland", 45.0, 3.0, fetch_fn=must_not_call,
     )
     assert out == cache
 
 
-def test_fetch_open_meteo_region_atomic_write(tmp_data_dir: Path) -> None:
+def test_fetch_nasa_power_region_atomic_write(tmp_data_dir: Path) -> None:
     """After a successful fetch, the final JSON exists and no .tmp lingers."""
     settings = get_settings()
-    cache = settings.open_meteo_raw_dir / f"{region_slug('TestRegion', 'Testland')}.json"
+    cache = settings.nasa_power_raw_dir / f"{region_slug('TestRegion', 'Testland')}.json"
     tmp = cache.with_suffix(cache.suffix + ".tmp")
 
     def fake_fetch(params: dict, target: Path) -> None:
         assert target.name.endswith(".tmp"), f"expected tmp path, got {target}"
-        _stub_open_meteo_fetch(params, target)
+        _stub_nasa_power_fetch(params, target)
 
-    out = fetch_open_meteo_region(
+    out = fetch_nasa_power_region(
         "TestRegion", "Testland", 45.0, 3.0, fetch_fn=fake_fetch,
     )
     assert out == cache
@@ -375,98 +421,76 @@ def test_fetch_open_meteo_region_atomic_write(tmp_data_dir: Path) -> None:
     assert not tmp.exists()
 
 
-def test_fetch_open_meteo_region_params_shape(tmp_data_dir: Path) -> None:
-    """The params dict matches Open-Meteo's archive endpoint contract."""
+def test_fetch_nasa_power_region_params_shape(tmp_data_dir: Path) -> None:
+    """The params dict matches NASA POWER's daily point endpoint contract."""
     captured: dict = {}
 
     def capturing_fetch(params: dict, target: Path) -> None:
         captured.update(params)
-        _stub_open_meteo_fetch(params, target)
+        _stub_nasa_power_fetch(params, target)
 
-    fetch_open_meteo_region("R", "C", 45.0, 3.0, fetch_fn=capturing_fetch)
+    fetch_nasa_power_region("R", "C", 45.0, 3.0, fetch_fn=capturing_fetch)
 
     start_year, end_year = CLIMATE_YEAR_RANGE
     assert captured["latitude"] == 45.0
     assert captured["longitude"] == 3.0
-    assert captured["start_date"] == f"{start_year}-01-01"
-    assert captured["end_date"] == f"{end_year}-12-31"
-    assert captured["timezone"] == "UTC"
-    assert tuple(captured["daily"].split(",")) == OPEN_METEO_DAILY_VARS
+    assert captured["start"] == f"{start_year}0101"
+    assert captured["end"] == f"{end_year}1231"
+    assert captured["community"] == NASA_POWER_COMMUNITY
+    assert captured["format"] == "JSON"
+    assert tuple(captured["parameters"].split(",")) == NASA_POWER_DAILY_VARS
 
 
-def test_fetch_open_meteo_region_transient_retries(tmp_data_dir: Path) -> None:
-    """A transient 5xx retries until success."""
+def test_fetch_nasa_power_region_transient_retries(tmp_data_dir: Path) -> None:
+    """A transient network error retries until success and uses backoff schedule."""
     attempts = {"n": 0}
 
     def flaky_fetch(params: dict, target: Path) -> None:
         attempts["n"] += 1
         if attempts["n"] < 3:
-            raise RuntimeError("HTTP 503 Service Unavailable")
-        _stub_open_meteo_fetch(params, target)
+            raise RuntimeError("network blip")
+        _stub_nasa_power_fetch(params, target)
 
     sleeps: list[float] = []
-    fetch_open_meteo_region(
+    fetch_nasa_power_region(
         "TestRegion", "Testland", 45.0, 3.0,
         fetch_fn=flaky_fetch, sleep_fn=sleeps.append,
     )
     assert attempts["n"] == 3
-    assert len(sleeps) == 2
+    # Two failures before success → two backoff sleeps, drawn from the schedule.
+    assert sleeps == [NASA_POWER_BACKOFF_SEC[0], NASA_POWER_BACKOFF_SEC[1]]
 
 
-def test_fetch_open_meteo_region_honors_retry_after(tmp_data_dir: Path) -> None:
-    """A 429 with `Retry-After: 7` makes the loop sleep exactly 7s, not the
-    default backoff (2s)."""
-    from vininator.features.climate import _RateLimited
-
-    attempts = {"n": 0}
-
-    def rate_limited_then_ok(params: dict, target: Path) -> None:
-        attempts["n"] += 1
-        if attempts["n"] == 1:
-            raise _RateLimited(retry_after_sec=7.0)
-        _stub_open_meteo_fetch(params, target)
-
-    sleeps: list[float] = []
-    fetch_open_meteo_region(
-        "TestRegion", "Testland", 45.0, 3.0,
-        fetch_fn=rate_limited_then_ok, sleep_fn=sleeps.append,
-    )
-    assert attempts["n"] == 2
-    assert sleeps == [7.0], "should have honored Retry-After, not used the 2s fallback"
-
-
-def test_fetch_open_meteo_region_429_without_retry_after_uses_fallback(
-    tmp_data_dir: Path,
-) -> None:
-    """A 429 with no Retry-After header falls back to OPEN_METEO_BACKOFF_SEC."""
-    from vininator.features.climate import _RateLimited
-
-    attempts = {"n": 0}
-
-    def rate_limited_then_ok(params: dict, target: Path) -> None:
-        attempts["n"] += 1
-        if attempts["n"] == 1:
-            raise _RateLimited(retry_after_sec=None)
-        _stub_open_meteo_fetch(params, target)
-
-    sleeps: list[float] = []
-    fetch_open_meteo_region(
-        "TestRegion", "Testland", 45.0, 3.0,
-        fetch_fn=rate_limited_then_ok, sleep_fn=sleeps.append,
-    )
-    assert sleeps == [2.0]  # first entry of OPEN_METEO_BACKOFF_SEC
-
-
-def test_fetch_open_meteo_region_persistent_failure_raises(tmp_data_dir: Path) -> None:
-    """If every retry fails, OpenMeteoError is raised with the underlying cause."""
+def test_fetch_nasa_power_region_persistent_failure_raises(tmp_data_dir: Path) -> None:
+    """If every retry fails, NasaPowerError is raised with the underlying cause."""
     def always_fails(params: dict, target: Path) -> None:
-        raise RuntimeError("HTTP 503 forever")
+        raise RuntimeError("network down forever")
 
-    with pytest.raises(OpenMeteoError, match="after"):
-        fetch_open_meteo_region(
+    with pytest.raises(NasaPowerError, match="after"):
+        fetch_nasa_power_region(
             "TestRegion", "Testland", 45.0, 3.0,
             fetch_fn=always_fails, sleep_fn=lambda _: None,
         )
+
+
+def test_fetch_nasa_power_region_4xx_does_not_retry(tmp_data_dir: Path) -> None:
+    """A NasaPowerError from the fetcher (e.g. 4xx bad params) propagates
+    immediately without burning the retry budget — retrying a parameter bug
+    just wastes the upstream service's time."""
+    attempts = {"n": 0}
+
+    def four_oh_four(params: dict, target: Path) -> None:
+        attempts["n"] += 1
+        raise NasaPowerError("HTTP 422 from POWER: bad parameter name")
+
+    sleeps: list[float] = []
+    with pytest.raises(NasaPowerError, match="422"):
+        fetch_nasa_power_region(
+            "TestRegion", "Testland", 45.0, 3.0,
+            fetch_fn=four_oh_four, sleep_fn=sleeps.append,
+        )
+    assert attempts["n"] == 1
+    assert sleeps == []
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +515,7 @@ def test_build_climate_table_filters_via_geocode_whitelist(tmp_data_dir: Path) -
         ],
     )
 
-    build_climate_table(fetch_fn=_stub_open_meteo_fetch)
+    build_climate_table(fetch_fn=_stub_nasa_power_fetch)
 
     df = pl.read_parquet(settings.climate_parquet)
     regions = set(df["region"].unique().to_list())
@@ -508,7 +532,7 @@ def test_build_climate_table_schema(tmp_data_dir: Path) -> None:
         [{"region": "GoodA", "country": "X", "lat": 45.0, "lon": 3.0,
           "result_type": "administrative"}],
     )
-    build_climate_table(fetch_fn=_stub_open_meteo_fetch)
+    build_climate_table(fetch_fn=_stub_nasa_power_fetch)
 
     df = pl.read_parquet(settings.climate_parquet)
     assert dict(df.schema) == CLIMATE_SCHEMA
@@ -522,7 +546,7 @@ def test_build_climate_table_resumes_existing_rows(tmp_data_dir: Path) -> None:
         [{"region": "GoodA", "country": "X", "lat": 45.0, "lon": 3.0,
           "result_type": "administrative"}],
     )
-    build_climate_table(fetch_fn=_stub_open_meteo_fetch)
+    build_climate_table(fetch_fn=_stub_nasa_power_fetch)
 
     def must_not_call(params: dict, target: Path) -> None:
         raise AssertionError("resume failed — fetch_fn called for existing row")

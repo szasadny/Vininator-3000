@@ -151,7 +151,7 @@ def features_climate(
         None, "--limit", help="Process at most N regions this run (resumable)."
     ),
 ) -> None:
-    """Pull Open-Meteo Historical Weather per region and derive climate features.
+    """Pull NASA POWER daily climate per region and derive climate features.
 
     Reads `data/interim/geocode.parquet` (status='ok' rows surviving the
     `filter_to_usable` blacklist). One HTTP request per region covers all years

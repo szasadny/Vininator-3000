@@ -1,6 +1,0 @@
-services:
-  climate:
-    build: .
-    volumes:
-      - ./data:/data
-    restart: on-failure

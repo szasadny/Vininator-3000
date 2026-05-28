@@ -2182,6 +2182,7 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "requests" },
     { name = "typer" },
+    { name = "tzdata" },
 ]
 
 [package.optional-dependencies]
@@ -2208,6 +2209,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "requests", specifier = ">=2.32" },
     { name = "typer", specifier = ">=0.12" },
+    { name = "tzdata", specifier = ">=2026.2" },
 ]
 provides-extras = ["notebook"]
 

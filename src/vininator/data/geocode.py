@@ -4,8 +4,8 @@ Phase 2 step 1. Every downstream terroir feature is keyed on `(lat, lon)`,
 so we need one geocode per unique region. Nominatim is free, rate-limited
 to 1 req/sec by their TOS, and noisy on ambiguous strings (e.g. "Bordeaux"
 can resolve to the city rather than the wine region). We accept the
-lossiness: appellation centroids are accurate enough for ERA5-Land's 9 km
-grid and SoilGrids' 250 m pixels.
+lossiness: appellation centroids are accurate enough for NASA POWER's
+~55 km grid and SoilGrids' 250 m pixels.
 
 The cache (`data/interim/geocode.parquet`) is the resume state. Re-running
 processes only `(region, country)` pairs not already present. Failed lookups

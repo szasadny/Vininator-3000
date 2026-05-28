@@ -1,6 +1,6 @@
 # Vininator 3000 — Project Plan
 
-A wine rating + tasting-note predictor trained on the X-Wines dataset, with a terroir feature pipeline combining ERA5-Land climate reanalysis (via Open-Meteo) with SoilGrids soil and terrain properties.
+A wine rating + tasting-note predictor trained on the X-Wines dataset, with a terroir feature pipeline combining NASA POWER daily climate (MERRA-2 + CERES SYN1DEG) with SoilGrids soil and terrain properties.
 
 ---
 
@@ -12,7 +12,7 @@ Three prediction targets, in increasing order of difficulty:
 2. **Structured profile** — body, acidity (X-Wines ships these as labels) + alcohol % (`ABV`)
 3. **Tasting notes** — retrieve the most similar real-review text and a multi-label set of flavor descriptors (X-Wines ships food pairings as the `Harmonize` column)
 
-**Inputs:** grape variety/blend, region (hierarchical), per-rating vintage year, producer (`WineryID`), `age_at_review`, plus a derived **terroir feature block** that combines `region × vintage` weather from ERA5-Land (via Open-Meteo) with `region`-level soil and terrain properties from SoilGrids.
+**Inputs:** grape variety/blend, region (hierarchical), per-rating vintage year, producer (`WineryID`), `age_at_review`, plus a derived **terroir feature block** that combines `region × vintage` weather from NASA POWER (MERRA-2 + CERES SYN1DEG) with `region`-level soil and terrain properties from SoilGrids.
 
 **Core objective:** build a predictive model that estimates a wine's sensory profile — including rating, structure, and tasting characteristics — from structured wine metadata, the bottle age at the moment of rating, and vintage-specific terroir conditions.
 
@@ -42,7 +42,7 @@ X-Wines CSVs (test | slim | full)
   data/raw/xwines_wines.parquet
   data/raw/xwines_ratings.parquet   (with derived `age_at_review`)
         │
-        ├─► geocoded regions ──┬─► Open-Meteo weather pull ──► climate.parquet
+        ├─► geocoded regions ──┬─► NASA POWER weather pull ──► climate.parquet
         │                       │                                │
         │                       └─► SoilGrids pull   ──► soil.parquet
         │                                                        │
@@ -61,7 +61,7 @@ X-Wines CSVs (test | slim | full)
         ▼
   FastAPI backend ──► React + Vite frontend (web UI)
                          │
-                         └─► TerroirProvider (cache-first Open-Meteo + SoilGrids
+                         └─► TerroirProvider (cache-first NASA POWER + SoilGrids
                                               for vintages newer than training)
 ```
 
@@ -88,23 +88,23 @@ The ML side is the primary deliverable. The web UI is a thin wrapper around the 
 - The same `(lat, lon)` feeds both the climate and the soil pipeline below.
 - **Audit `result_type` before downstream use.** Nominatim returns the OSM entity type ("administrative", "region", "city", "village", "house", "monument", …). Some X-Wines region strings resolve to the *wrong* entity — e.g. "Buenos Aires, Argentina" → city centre, "Scanderbeg, Albania" → a public square named after the historical figure. These rows pass `status='ok'` but their coordinates don't land in vineyard country, so SoilGrids returns null and the terroir signal is junk. Before any model trains on these features, filter the geocode parquet to keep only `result_type ∈ {administrative, region, county, state, locality, suburb, isolated_dwelling, hamlet, village}` (or a similar whitelist refined against the actual distribution). The soil pull is unaffected — CatBoost handles the nulls — but the filter must happen before training so the bad rows don't enter the training set.
 
-**Weather (ERA5-Land via Open-Meteo Historical Weather API)**
+**Weather (NASA POWER Daily API)**
 
-**Strategy: one HTTP request per region.** Open-Meteo wraps the same ERA5-Land reanalysis (0.1° / ~11 km, 1950-present) that Copernicus CDS publishes, behind a clean JSON REST endpoint. A single request fetches all of `CLIMATE_YEAR_RANGE` × all five daily variables for one (lat, lon). After the PR2.5 geocode blacklist there are **~1,377 requests total**, cached as one JSON per region under `data/raw/open_meteo/{slug}.json`. No account, no licence acceptance, no NetCDF parsing.
+**Strategy: one HTTP request per region.** [NASA POWER](https://power.larc.nasa.gov/) is a free, public-domain REST/JSON endpoint serving daily MERRA-2 meteorology and CERES SYN1DEG solar radiation at ~0.5° / ~55 km resolution, going back to 1981. A single request fetches all of `CLIMATE_YEAR_RANGE` × all five daily variables for one (lat, lon). After the PR2.5 geocode blacklist there are **~1,377 requests total**, cached as one JSON per region under `data/raw/nasa_power/{slug}.json`. No account, no token, no NetCDF parsing.
 
-**Why Open-Meteo over CDS directly?** Same underlying data, but 1,377 small HTTP calls instead of 8.3k–128k chunked CDS calls; the CDS per-request cost limit forces year-and-statistic chunking that Open-Meteo handles server-side. CDS would still be a fallback if Open-Meteo ToS becomes a blocker (see below).
+**Why NASA POWER over Open-Meteo / ERA5-Land?** We initially pivoted *to* Open-Meteo (an ERA5-Land wrapper, 0.1° / ~11 km) because it avoided Copernicus CDS chunking, then pivoted *off* it when the free tier turned out to bill per data point — 30 years × 5 variables × one coordinate exceeded the daily quota in a single region pull. NASA POWER's coarser resolution is the cost of staying free; for the growing-degree-day / heat-spike / harvest-precip aggregates we actually compute, the ~5× resolution downgrade is negligible compared to the centroid-vs-vineyard error already baked into region geocoding. POWER's temperature data is itself derived from MERRA-2 (sibling to ERA5-Land in lineage), so the underlying science isn't a step down — just the grid.
 
-**Variables pulled per region** (Open-Meteo daily-API names → our feature math):
+**Variables pulled per region** (NASA POWER variable IDs → our feature math, units verified via live API metadata):
 
-| Open-Meteo variable | Units | Used for |
+| NASA POWER variable | Units | Used for |
 | --- | --- | --- |
-| `temperature_2m_min` | °C | Spring frost days, diurnal range |
-| `temperature_2m_mean` | °C | GDD, climatology baseline, anomalies |
-| `temperature_2m_max` | °C | Heat-spike days, diurnal range |
-| `precipitation_sum` | mm | Growing-season + harvest-month precip |
-| `shortwave_radiation_sum` | MJ/m² | Sunshine / cloud-cover proxy |
+| `T2M_MIN` | °C | Spring frost days, diurnal range |
+| `T2M` | °C | GDD, climatology baseline, anomalies |
+| `T2M_MAX` | °C | Heat-spike days, diurnal range |
+| `PRECTOTCORR` | mm/day | Growing-season + harvest-month precip |
+| `ALLSKY_SFC_SW_DWN` | MJ/m²/day | Sunshine / cloud-cover proxy |
 
-Units land in exactly the form `compute_climate_features` expects — no unit conversion in the loader.
+Units land in exactly the form `compute_climate_features` expects — no unit conversion in the loader. POWER returns `-999.0` for days where the source product was unavailable; `load_nasa_power_daily` coerces that sentinel to null so downstream null-detection (`is_partial`, climatology skip) works the same as it did with Open-Meteo's explicit nulls.
 
 **Growing season mask** (applied at feature time, not at fetch time, so we can recompute thresholds without re-fetching):
 
@@ -122,18 +122,18 @@ Units land in exactly the form `compute_climate_features` expects — no unit co
 - **Total growing-season solar radiation** (MJ/m²).
 - **Anomaly vs. 1991–2018 regional climatology** for each of the above. The baseline window deliberately ends at the training cutoff (2018) rather than the WMO-standard 1991–2020, so the anomaly column carries **zero information leakage** into the 2019–2021 future-vintage holdout. If the climatology used 2019–2020 it would peek at the held-out years and overstate the model's out-of-sample skill on vintages we haven't trained on. The climatology is computed once per region from the same per-region pull (no extra HTTP calls). A hot year in Bordeaux means something different from a hot year in Mendoza, so the anomaly often predicts better than the absolute value.
 
-**Partial-vintage handling.** A growing-season window may extend outside the pulled year range (e.g. a Southern-hemisphere 1991 vintage's October–December 1990 leg falls before 1991) or carry explicit nulls at the trailing edge (Open-Meteo backfills the most recent days over weeks). The batch path computes features on whatever days are present and sets `is_partial=True` on the row — both for missing dates and for null `tmean` inside the season. Rows are kept; the downstream model can decide whether to use them. The Phase 7 `TerroirProvider` is the only path that *substitutes* climatology for the partial season — batch never does.
+**Partial-vintage handling.** A growing-season window may extend outside the pulled year range (e.g. a Southern-hemisphere 1991 vintage's October–December 1990 leg falls before 1991) or carry nulls inside the season (POWER's `-999.0` sentinel after parsing, for days where the source product was unavailable). The batch path computes features on whatever days are present and sets `is_partial=True` on the row — both for missing dates and for null `tmean` inside the season. Rows are kept; the downstream model can decide whether to use them. The Phase 7 `TerroirProvider` is the only path that *substitutes* climatology for the partial season — batch never does.
 
-**Open-Meteo compliance & politeness**
+**NASA POWER compliance & politeness**
 
-- **Free tier is non-commercial.** Vininator is a personal/learning project so this is fine. If the project ever needs commercial deployment, swap to Open-Meteo's paid endpoint and add the API key to env. No code restructure.
-- **Polite request spacing.** 0.5 s between submissions (~2 req/sec) keeps us comfortably under the 10k/day free-tier cap; 1,377 regions take roughly 12 minutes of wall time even sequentially.
-- **Backoff on transient failures.** Exponential backoff (2s, 4s, 8s, 16s, 32s, 60s) on network blips and 429/5xx. Persistent failure after all retries raises `OpenMeteoError` and stops the run.
+- **Public domain data.** POWER data are released without licence restrictions. Vininator embeds an acknowledgement of LaRC and the underlying MERRA-2 / CERES SYN1DEG sources in parquet metadata — required courtesy, not a legal blocker.
+- **Polite request spacing.** POWER doesn't publish a hard rate limit but the docs warn that hammering the same coordinate triggers opaque blocking. 1 s between submissions keeps the 1,377-region pull at ~23 minutes wall time and well clear of "hammering" territory.
+- **Backoff on transient failures.** Exponential backoff (2s, 8s, 30s, 60s, 120s, 300s) on network blips and 5xx. POWER returns no structured `Retry-After`, so every retry uses the same schedule. Persistent failure after all retries raises `NasaPowerError` and stops the run.
 - **Resume from disk, not memory.** Each region's JSON is written atomically (`tmp` → `rename`). On restart, the loader skips any region whose `.json` already exists and is non-empty. No central state file — the cache *is* the state.
-- **User-Agent** identifies the project: `vininator-3000/0.1`. Open-Meteo doesn't demand a contactable operator, but identifying ourselves is good manners.
-- **Attribution.** Every derived artifact (`climate.parquet`, trained models) gets the Open-Meteo + ERA5-Land attribution embedded in its metadata: *"Weather data by Open-Meteo.com, CC BY 4.0, derived from ERA5-Land reanalysis by ECMWF / Copernicus Climate Change Service."*
+- **User-Agent** identifies the project: `vininator-3000/0.1`. POWER doesn't require a contactable operator, but identifying ourselves is good manners.
+- **Attribution.** Every derived artifact (`climate.parquet`, trained models) gets the POWER attribution embedded in its metadata: *"Weather data from the NASA Langley Research Center POWER Project, funded through the NASA Earth Science Directorate Applied Science Program. Underlying sources: MERRA-2 (meteorology) and CERES SYN1DEG (solar radiation)."*
 
-**Sizing (one-time, end-to-end):** 1,377 HTTP requests, each returning ~3-5 MB JSON. Total raw cache lands at roughly ~5 GB JSON for 1991–2021. Aggregated `climate.parquet` is small (one row per `(region, vintage_year)` × 31 years × ~1.4k regions = ~43k rows).
+**Sizing (one-time, end-to-end):** 1,377 HTTP requests, each returning a multi-megabyte JSON spanning 31 years. Aggregated `climate.parquet` is small (one row per `(region, vintage_year)` × 31 years × ~1.4k regions = ~43k rows).
 
 **Soil & terrain (SoilGrids 250m via ISRIC REST API)**
 
@@ -153,7 +153,7 @@ Soil composition is a defining component of terroir and is largely time-invarian
 - Pull **elevation and slope** from a DEM (SRTM 30m via `elevation` or Open-Elevation) at the same centroid. Slope and aspect influence sun exposure and frost drainage; elevation correlates with diurnal range.
 - Cache raw SoilGrids responses per region to `data/interim/soil_raw/`. The API is friendly but flaky — resume must work.
 
-**Deliverable:** `data/interim/climate.parquet` keyed by `(region, vintage_year)`, `data/interim/soil.parquet` keyed by `region`, and a joined `data/interim/terroir.parquet`. Source files: `src/vininator/features/climate.py`, `src/vininator/features/soil.py`, `src/vininator/features/terroir.py` (joiner).
+**Deliverable:** `data/interim/climate.parquet` keyed by `(region, vintage_year)`, `data/interim/soil.parquet` keyed by `region`, and a joined `data/interim/terroir.parquet`. Source files: `src/vininator/features/climate.py` (NASA POWER), `src/vininator/features/soil.py`, `src/vininator/features/terroir.py` (joiner).
 
 ### Phase 3 — Feature engineering & dataset assembly
 
@@ -244,7 +244,7 @@ Thin wrapper around the model. Backend serves predictions; frontend lets users e
   - `opening_year` is used to derive `bottle_age = opening_year - vintage_year`, applied at inference as an aging-adjustment feature.
 - `GET /regions`, `GET /grapes`, `GET /brands?q=…` — autocomplete endpoints backed by the dataset.
 - Models loaded once at startup, kept in memory. Wrap in a `PredictionService`.
-- The service resolves the terroir block for the requested `(region, vintage_year)` via a `TerroirProvider` (Phase 7) that hits cache first, fetches live data only on miss.
+- The service resolves the terroir block for the requested `(region, vintage_year)` via a `TerroirProvider` (Phase 7) that hits cache first, fetches live NASA POWER + SoilGrids only on miss.
 - No DB needed for v1 — the dataset is read-only, served from parquet.
 
 **Frontend (React + Vite + TypeScript + Tailwind)**
@@ -282,23 +282,23 @@ client → /predict
             │
             ├─ R2 object hit? ───────► return (warm SQLite + LRU)
             │
-            └─ MISS: fetch Open-Meteo + SoilGrids + DEM
+            └─ MISS: fetch NASA POWER + SoilGrids + DEM
                        ──► write R2, SQLite, LRU
                        ──► return
 ```
 
 - The same feature code used in Phase 2 is reused — `features/climate.py` and `features/soil.py` expose pure functions over `(lat, lon, year)` that don't care whether they're called from a batch notebook or from a request handler.
-- A request for an unseen `(region, vintage)` pays one Open-Meteo round-trip (sub-second for a single vintage year); every subsequent request for the same key is milliseconds.
+- A request for an unseen `(region, vintage)` pays one NASA POWER round-trip (sub-second for a single vintage year); every subsequent request for the same key is milliseconds.
 - A background warmer can pre-populate the cache for popular regions × the latest closed vintages on a daily cron — keeps the user-facing miss rate near zero.
 
 **Operational notes**
 
-- ERA5-Land (via Open-Meteo) has a ~5-day publication lag and the latest year's growing season may be incomplete — the provider must detect this (null `tmean` inside the season window) and fall back to climatology + partial-season anomalies rather than returning nothing.
+- NASA POWER's MERRA-2 inputs have a multi-week publication lag and the latest year's growing season may be incomplete — the provider must detect this (null `tmean` inside the season window, after the `-999.0` → null coercion) and fall back to climatology + partial-season anomalies rather than returning nothing.
 - SoilGrids is essentially time-invariant; one fetch per region is enough forever.
-- Soft TTL: weather entries refresh after 90 days (in case Open-Meteo backfills ERA5-Land corrections), soil entries effectively never expire.
-- No API keys needed for Open-Meteo's free tier; if we ever move to the commercial tier the key lives in the host's secret store, never in the image.
+- Soft TTL: weather entries refresh after 90 days (in case POWER backfills MERRA-2/CERES corrections), soil entries effectively never expire.
+- No API keys needed for NASA POWER — public domain, anonymous access. SoilGrids is also auth-free.
 
-**Deliverables:** `src/vininator/api/terroir_provider.py`, deployment configs (`fly.toml` or `Dockerfile` + Spaces config), a Cloudflare Pages / Vercel project for the frontend, and a small cron entrypoint for cache warming.
+**Deliverables:** `src/vininator/api/terroir_provider.py` (cache-first NASA POWER + SoilGrids fetcher), deployment configs (`fly.toml` or `Dockerfile` + Spaces config), a Cloudflare Pages / Vercel project for the frontend, and a small cron entrypoint for cache warming.
 
 ---
 
@@ -311,7 +311,7 @@ vininator/
 ├── PROJECT.md              # this file
 ├── CLAUDE.md               # operating rules for Claude Code
 ├── data/
-│   ├── raw/                # X-Wines CSVs + parquets, Open-Meteo JSON pulls, SoilGrids responses
+│   ├── raw/                # X-Wines CSVs + parquets, NASA POWER JSON pulls, SoilGrids responses
 │   ├── interim/            # geocoded regions, climate.parquet, soil.parquet, terroir.parquet
 │   └── processed/          # final feature parquets (train/test/future_vintage)
 ├── src/vininator/
@@ -319,7 +319,7 @@ vininator/
 │   │   ├── load.py         # X-Wines loader
 │   │   └── geocode.py      # region → lat/lon (cached)
 │   ├── features/
-│   │   ├── climate.py      # Open-Meteo → GDD, precip, anomalies
+│   │   ├── climate.py      # NASA POWER → GDD, precip, anomalies
 │   │   ├── soil.py         # SoilGrids + DEM → CaCO3, pH, texture, slope, ...
 │   │   ├── terroir.py      # join climate + soil into the terroir block
 │   │   ├── text.py         # parse body/acidity/tannin/flavors from notes
@@ -337,7 +337,7 @@ vininator/
 │   │   ├── routes.py
 │   │   ├── schemas.py
 │   │   ├── service.py      # wraps trained models, single source of inference
-│   │   └── terroir_provider.py  # cache-first live Open-Meteo + SoilGrids fetcher
+│   │   └── terroir_provider.py  # cache-first live NASA POWER + SoilGrids fetcher
 │   └── cli.py              # typer CLI: vininator train rating, etc.
 ├── frontend/
 │   ├── package.json
@@ -364,7 +364,7 @@ vininator/
 | Data wrangling | `polars` | Faster than pandas at 800k rows; lazy is nice |
 | Modeling | `catboost` | Native categorical support; no manual encoding |
 | Text | `sentence-transformers`, `re` | MiniLM for embeddings; regex for body/acidity parsing |
-| Weather | Open-Meteo Historical Weather API | ERA5-Land via clean JSON REST, no auth |
+| Weather | NASA POWER Daily API | MERRA-2 + CERES SYN1DEG via clean JSON REST, no auth |
 | Soil | SoilGrids REST API (ISRIC) | Free, no auth, global 250 m coverage |
 | Terrain | SRTM 30 m via `elevation` or Open-Elevation | Free; elevation + slope per centroid |
 | Geocoding | `geopy` (Nominatim) | Free; respect rate limits |
@@ -378,7 +378,7 @@ vininator/
 
 ## 7. Realistic things to know
 
-- **Open-Meteo pulls take ~12 minutes sequentially.** One HTTP request per region (~1,377 total after the geocode blacklist), polite 0.5s spacing, exponential backoff on 429/5xx, resume-from-disk per JSON file. The cache *is* the state — a half-finished run restarts cleanly. Attribution must be embedded in derived artifacts (Open-Meteo CC BY 4.0 + upstream ERA5-Land lineage). Free tier is non-commercial only; Vininator is a personal/learning project. If the free tier ever breaks for us, Copernicus CDS direct is the documented fallback path — same ERA5-Land data, just much chunkier.
+- **NASA POWER pulls take ~23 minutes sequentially.** One HTTP request per region (~1,377 total after the geocode blacklist), polite 1s spacing, exponential backoff on 5xx, resume-from-disk per JSON file. The cache *is* the state — a half-finished run restarts cleanly. Attribution must be embedded in derived artifacts (LaRC POWER + MERRA-2 + CERES SYN1DEG lineage). Public domain, no auth, no quota. We pivoted off Open-Meteo's ERA5-Land wrapper after discovering its free tier bills per data point — 30 years × 5 vars × one coordinate exceeded the daily quota in a single region pull. POWER's ~55 km cells are coarser than ERA5-Land's ~11 km, but for growing-season aggregates the difference is negligible next to the centroid-vs-vineyard error.
 - **Climatology window is 1991–2018, not the WMO-standard 1991–2020.** The baseline used to compute climate anomalies ends at the training cutoff so the anomaly column contains zero information about the 2019–2021 future-vintage holdout. Reporting that "the model generalizes to future vintages" would be a lie if the anomalies it trained on already peeked at those vintages.
 - **SoilGrids is fast but flaky.** Single-pixel queries can be noisy and the endpoint occasionally 5xxs. Always buffer-and-average, always retry with backoff, always cache.
 - **Geocoding has rate limits.** Nominatim asks for 1 req/sec. A few thousand regions is fine, just plan for it.
