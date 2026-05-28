@@ -223,6 +223,7 @@ NASA_POWER_ATTRIBUTION = (
 NASA_POWER_RAW_DIRNAME = "nasa_power"
 CLIMATE_PARQUET = "climate.parquet"
 CLIMATOLOGY_PARQUET = "climatology.parquet"
+TERROIR_PARQUET = "terroir.parquet"
 
 # 1991 is the start of the climate record we care about (also the start of
 # the WMO-era ERA5 baseline window the literature uses); 2021 is the X-Wines
@@ -390,6 +391,12 @@ class Settings(BaseSettings):
     def climatology_parquet(self) -> Path:
         """Per-region long-form climatology means over CLIMATOLOGY_WINDOW."""
         return self.interim_dir / CLIMATOLOGY_PARQUET
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def terroir_parquet(self) -> Path:
+        """climate.parquet ⨝ soil.parquet, keyed on (region, country, vintage_year)."""
+        return self.interim_dir / TERROIR_PARQUET
 
     def ensure_dirs(self) -> None:
         """Create the data layout if missing. Idempotent."""

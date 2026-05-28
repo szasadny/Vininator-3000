@@ -21,6 +21,7 @@ from vininator.data.geocode import (
 from vininator.data.load import download_xwines, xwines_info
 from vininator.features.climate import build_climate_table
 from vininator.features.soil import build_soil_table
+from vininator.features.terroir import build_terroir_table
 
 app = typer.Typer(
     name="vininator",
@@ -168,6 +169,22 @@ def features_climate(
         force=force, limit=limit, progress_fn=progress, notify_fn=typer.echo
     )
     typer.echo(f"Climate table: {path}")
+
+
+@features_app.command("terroir")
+def features_terroir(
+    force: bool = typer.Option(
+        False, "--force", help="Rebuild from current inputs (the build always rebuilds; flag is accepted for CLI symmetry)."
+    ),
+) -> None:
+    """Join climate.parquet ⨝ soil.parquet → terroir.parquet.
+
+    Pure compose: left-joins soil onto climate on (region, country). No
+    network, no incremental state — running it twice gives the same parquet
+    as long as the inputs haven't changed.
+    """
+    path = build_terroir_table(force=force, notify_fn=typer.echo)
+    typer.echo(f"Terroir table: {path}")
 
 
 if __name__ == "__main__":
