@@ -265,6 +265,34 @@ CLIMATE_ABSOLUTE_FEATURES: tuple[str, ...] = (
     "solar_total_mj",
 )
 
+# ---------------------------------------------------------------------------
+# Phase 3 — Feature assembly & splits
+# ---------------------------------------------------------------------------
+
+# Future-vintage holdout: train on vintages ≤ 2018, hold out 2019–2021 as a
+# separate test to measure whether the model learned terroir or memorised
+# region averages. This window matches the training cutoff used for the
+# climatology baseline so the anomaly columns carry zero leakage.
+FUTURE_VINTAGE_HOLDOUT: tuple[int, int] = (2019, 2021)
+
+# Fraction of wines (by WineID) held back as the random test set. The
+# future-vintage holdout is separate and additional.
+TRAIN_HOLDOUT_FRAC = 0.15
+
+# Seed for the WineID shuffle that produces train vs. test wines. Fix this
+# once and never change it — changing after training makes comparisons
+# meaningless.
+WINE_SPLIT_SEED = 42
+
+# Vocabulary sizes for multi-hot features derived from list columns.
+# Computed on the training fold only; unseen grapes/pairings → all-zero row.
+TOP_K_GRAPES = 50
+TOP_K_HARMONIZE = 30
+
+PROCESSED_TRAIN_PARQUET = "train.parquet"
+PROCESSED_TEST_PARQUET = "test.parquet"
+PROCESSED_FUTURE_VINTAGE_TEST_PARQUET = "future_vintage_test.parquet"
+
 
 def _project_root() -> Path:
     """Walk up from this file until we find the repo's `pyproject.toml`.
@@ -397,6 +425,24 @@ class Settings(BaseSettings):
     def terroir_parquet(self) -> Path:
         """climate.parquet ⨝ soil.parquet, keyed on (region, country, vintage_year)."""
         return self.interim_dir / TERROIR_PARQUET
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def processed_train_parquet(self) -> Path:
+        """Final training table (one row per rating, vintage ≤ 2018, train WineIDs)."""
+        return self.processed_dir / PROCESSED_TRAIN_PARQUET
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def processed_test_parquet(self) -> Path:
+        """Held-out wine test set (one row per rating, vintage ≤ 2018, test WineIDs)."""
+        return self.processed_dir / PROCESSED_TEST_PARQUET
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def processed_future_vintage_test_parquet(self) -> Path:
+        """Future-vintage holdout (vintage 2019–2021, any WineID)."""
+        return self.processed_dir / PROCESSED_FUTURE_VINTAGE_TEST_PARQUET
 
     def ensure_dirs(self) -> None:
         """Create the data layout if missing. Idempotent."""

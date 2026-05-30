@@ -5,16 +5,18 @@
 A machine learning project that combines the [X-Wines](https://github.com/rogerioxavier/X-Wines) dataset with growing-season weather data from [NASA POWER](https://power.larc.nasa.gov/) (MERRA-2 + CERES SYN1DEG) and [SoilGrids](https://soilgrids.org/) soil and terrain data to predict:
 
 - **Rating** — the 1–5 star score a wine is likely to receive
-- **Profile** — body, acidity, and tannin levels (Body / Acidity columns ship in X-Wines)
-- **Tasting notes** — retrieved similar real reviews + flavor descriptors (food pairings ship as the `Harmonize` column)
+- **Profile** — body and acidity (X-Wines ships these as labels)
+- **Food-pairing profile** — multi-label prediction over the top-N Harmonize pairings (closest proxy to a tasting profile without review text)
 
-The project evaluates how much vintage-specific climate features and region-level soil composition contribute to predicting a wine's sensory profile beyond producer, region, grape, price, and `age_at_review`.
+The project evaluates how much vintage-specific climate features and region-level soil composition contribute to predicting a wine's sensory profile beyond producer, region, grape, price, and `age_at_review`. The trained rating model then feeds a **drink-now / age-well recommender** that sweeps `age_at_review` over future opening years to surface monogrape wines best drunk this year — or worth cellaring for later. Findings are published in [RESULTS.md](./RESULTS.md).
 
 ---
 
 ## Status
 
-🚧 **In development.** Phase 2. See [PROJECT.md](./PROJECT.md) for the full plan and current phase.
+🚧 **In development.** Phase 4. See [PROJECT.md](./PROJECT.md) for the full plan and current phase.
+
+This is a batch / CLI project — no hosted UI, no live API. The deliverable is the trained models, the ablation findings, and the drink-now / age-well recommendations published in [RESULTS.md](./RESULTS.md).
 
 ---
 
@@ -24,7 +26,6 @@ The project evaluates how much vintage-specific climate features and region-leve
 
 - Python 3.12+
 - [`uv`](https://github.com/astral-sh/uv) for dependency management
-- Node 20+ and pnpm (only if you want to run the web UI)
 
 Weather data is pulled from the [NASA POWER Daily API](https://power.larc.nasa.gov/docs/services/api/temporal/daily/), which is free, public-domain, and needs no account or API key.
 
@@ -70,23 +71,20 @@ uv run vininator features soil
 # 4. Assemble the training table
 uv run vininator features build
 
-# 5. Train the rating model
+# 5. Train the rating, profile, and Harmonize models
 uv run vininator train rating --config configs/rating_v1.yaml
+uv run vininator train profile --config configs/profile_v1.yaml
+uv run vininator train harmonize --config configs/harmonize_v1.yaml
 
 # 6. Measure each feature block's contribution by retraining with it dropped
 uv run vininator eval ablations
-```
 
-### Web UI (local)
+# 7. Drink-now and age-well rankings (Phase 6)
+uv run vininator recommend drink-now --opening-year 2026 --grape pinot-noir --max-vintage-age 5
+uv run vininator recommend age-well  --opening-year 2026 --horizon 10 --grape nebbiolo
 
-```bash
-# Backend
-uv run vininator api serve   # http://localhost:8000
-
-# Frontend (in another terminal)
-cd frontend
-pnpm install
-pnpm dev                     # http://localhost:5173
+# 8. Regenerate RESULTS.md + reports/figures from the trained artifacts
+uv run python scripts/build_results.py
 ```
 
 ---
@@ -96,17 +94,17 @@ pnpm dev                     # http://localhost:5173
 ```text
 src/vininator/
   data/         X-Wines loader, geocoding (cached)
-  features/     Climate (NASA POWER), soil & terrain (SoilGrids + DEM), terroir joiner, text parsing, feature assembly
-  models/       CatBoost rating + profile, flavor-tag multi-label, retrieval-based tasting notes
+  features/     Climate (NASA POWER), soil & terrain (SoilGrids + DEM), terroir joiner, Harmonize parsing, feature assembly
+  models/       CatBoost rating regressor (+ quantile heads), body / acidity classifiers, Harmonize multi-label
   eval/         Metrics, ablations, SHAP
-  api/          FastAPI service + cache-first terroir provider for live vintages
+  recommend/    drink-now and age-well rankings by sweeping age_at_review
   cli.py        Typer CLI entrypoint
 
-frontend/        React + Vite + TypeScript + Tailwind
+scripts/         build_results.py — regenerates RESULTS.md + reports/figures from artifacts
 data/            raw → interim → processed (never edited after write)
-notebooks/       01_eda, 02_climate, 03_soil, 04_rating, 05_tags, 06_ablations
+notebooks/       01_eda, 02_climate, 03_soil, 04_rating, 05_harmonize, 06_ablations, 07_recommender, 08_results
 configs/         One YAML per experiment
-deploy/          fly.toml / Dockerfile / Pages config / cron warmer
+reports/figures/ SHAP plots, ablation charts, recommender summaries (embedded in RESULTS.md)
 tests/           pytest suite
 ```
 
@@ -143,8 +141,8 @@ Each rating ships with **`Date`** (ISO timestamp) plus the rated **`Vintage`**, 
 - **`age_at_review`** is a real per-row feature, derived from `Date` and `Vintage` at load time.
 - **Producer (`WineryID`) aggregates computed on training fold only.** Standard target-leakage prevention.
 - **CatBoost over manual encoding.** High-cardinality categoricals (`WineryID`, `RegionName`) handled natively.
-- **Retrieval only for tasting notes.** Notes are surfaced by retrieving the most similar real reviews — no generative model, no hallucinated flavor descriptions.
-- **Cache-first live serving.** The model is trained on historical vintages, but the API can answer for any `(region, vintage_year)` — including this year's — by transparently fetching and caching the missing terroir data.
+
+- **`age_at_review` is the recommender's lever.** Sweeping `age_at_review` against the trained rating model projects predicted ratings forward to any opening year, which is how the drink-now and age-well rankings are produced.
 
 ---
 
@@ -152,23 +150,11 @@ Each rating ships with **`Date`** (ISO timestamp) plus the rated **`Vintage`**, 
 
 - **Rating:** RMSE + MAE on held-out wines and on the future-vintage split.
 - **Profile:** per-attribute accuracy and macro-F1 against the X-Wines Body / Acidity labels.
-- **Flavor tags:** per-label F1 + Jaccard similarity (with attention to rarer tokens, not just "cherry" and "oak").
+- **Harmonize food pairings:** per-label F1 + Hamming loss on held-out wines.
 - **Ablations:** drop terroir, drop producer, drop `age_at_review` — quantify each block's marginal contribution.
 - **SHAP** on the rating model to understand what's actually doing the work.
 
----
-
-## Deployment
-
-The hosted web app is built for cheap, scale-to-zero operation:
-
-| Layer | Service | Notes |
-| --- | --- | --- |
-| Frontend | Cloudflare Pages (or Vercel / Netlify) | Static React build, global CDN, free tier |
-| Backend | Fly.io tiny VM **or** HuggingFace Spaces (free CPU) | Keeps the CatBoost models in RAM, scales to zero when idle |
-| Terroir cache | Cloudflare R2 / Backblaze B2 + on-VM SQLite + in-process LRU | Three-tier cache so live requests hit hot storage |
-
-The user-facing form takes **vintage year**, **year of opening**, **region** and **composition** (grape varieties + percentage shares). For any `(region, vintage_year)` the trained model has not seen, the backend's `TerroirProvider` fetches NASA POWER + SoilGrids on demand, stores the result in R2/SQLite/LRU, and serves every subsequent request from cache. A small daily cron warms the cache for popular regions and the latest closed vintages.
+All metrics, ablation tables, SHAP plots, and drink-now / age-well recommendation tables are published in [RESULTS.md](./RESULTS.md).
 
 ---
 

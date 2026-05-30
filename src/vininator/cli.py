@@ -19,6 +19,7 @@ from vininator.data.geocode import (
     scan_geocode,
 )
 from vininator.data.load import download_xwines, xwines_info
+from vininator.features.build import build_processed_tables
 from vininator.features.climate import build_climate_table
 from vininator.features.soil import build_soil_table
 from vininator.features.terroir import build_terroir_table
@@ -185,6 +186,40 @@ def features_terroir(
     """
     path = build_terroir_table(force=force, notify_fn=typer.echo)
     typer.echo(f"Terroir table: {path}")
+
+
+@features_app.command("build")
+def features_build(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Overwrite existing processed parquets even if they already exist.",
+    ),
+) -> None:
+    """Assemble the final modeling table from X-Wines + terroir.
+
+    Joins wines × ratings × terroir (one row per rating), adds grape and
+    food-pairing multi-hot features, computes producer aggregates and sample
+    weights on the training fold only, then writes three leakage-safe parquets
+    to data/processed/:
+
+    \b
+      train.parquet              ~85% of wines, vintage ≤ 2018
+      test.parquet               ~15% of wines, vintage ≤ 2018
+      future_vintage_test.parquet  all wines, vintage 2019–2021
+
+    Requires geocode.parquet, climate.parquet, soil.parquet, and terroir.parquet
+    to exist (run the earlier `features` sub-commands first).
+
+    NV ratings (null Vintage) are silently dropped — they cannot join terroir.
+    """
+    report = build_processed_tables(force=force, notify_fn=typer.echo)
+    typer.echo(f"train rows:                {report.train_rows:>12,}")
+    typer.echo(f"test rows:                 {report.test_rows:>12,}")
+    typer.echo(f"future vintage test rows:  {report.future_vintage_test_rows:>12,}")
+    typer.echo(f"grape vocab size:          {report.grape_vocab_size:>12,}")
+    typer.echo(f"harmonize vocab size:      {report.harmonize_vocab_size:>12,}")
+    typer.echo(f"output columns:            {report.output_columns:>12,}")
 
 
 if __name__ == "__main__":
